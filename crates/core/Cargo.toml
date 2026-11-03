@@ -1,0 +1,12 @@
+[package]
+name = "purimaster-core"
+version = "0.1.0"
+edition = "2024"
+description = "Purimaster 扫描/分析引擎（平台无关，不依赖 Tauri 与 Windows 特有 API）"
+
+[dependencies]
+rayon = "1.12"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
