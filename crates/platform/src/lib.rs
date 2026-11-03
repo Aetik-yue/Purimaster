@@ -9,7 +9,19 @@
 //!   （系统二进制目录、个人文档目录等，任何情况下都不允许清理）
 //! - **ancestor_only**：目标等于它、或是它的祖先拒绝（不允许整体清除），
 //!   但其内部的具体子目录可以作为清理目标（如 `%SystemRoot%\Temp`）
+//!
+//! ## 路径解析（2026-11-04 审查后加固）
+//!
+//! 校验前先用 `fs::canonicalize` 把目标解析为真实路径，因此以下绕过手法都会被
+//! 归一化后拦截：`..` 路径穿越、`\\?\` / `\\?\UNC\` 前缀、8.3 短名、
+//! 符号链接/目录联接（junction）。
+//!
+//! - 目标不存在（`NotFound`）：返回 `Ok`——不存在的路径没有任何可扫描/删除的内容；
+//!   **删除动作落地前必须在删除时重新校验**（文件可能在扫描与删除之间被创建）。
+//! - 其它解析失败（如权限不足）：保守拒绝。
 
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 /// 保护路径配置。
@@ -89,21 +101,42 @@ pub fn check_target_against(target: &Path, protection: &Protection) -> Result<()
         return Err("不允许以盘符根目录作为清理目标".to_string());
     }
 
-    let t = normalize(target);
+    // 解析为真实路径：`..` / 8.3 短名 / 符号链接 / 联接点 / `\\?\` 前缀全部归一化
+    let t = match fs::canonicalize(target) {
+        Ok(real) => normalize(&real),
+        // 目标不存在：没有任何可扫描/删除的内容，不构成风险。
+        // 注意：删除动作必须在使用时重新校验。
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        // 其它错误（权限不足等）：保守拒绝
+        Err(e) => return Err(format!("无法解析清理目标（保守拒绝）：{e}")),
+    };
+
+    if is_drive_root(Path::new(&t)) {
+        return Err("不允许以盘符根目录作为清理目标".to_string());
+    }
+
     for s in &protection.sensitive {
-        let s = normalize(s);
+        let s = resolve_key(s);
         if related(&t, &s) {
-            return Err(format!("目标命中受保护路径：{}", s));
+            return Err(format!("目标命中受保护路径：{s}"));
         }
     }
     for a in &protection.ancestor_only {
-        let a = normalize(a);
+        let a = resolve_key(a);
         // 目标等于它、或目标是它的祖先 → 拒绝整体清除；其内部子目录允许
         if t == a || is_strict_prefix(&t, &a) {
-            return Err(format!("不允许整体清除受保护目录：{}", a));
+            return Err(format!("不允许整体清除受保护目录：{a}"));
         }
     }
     Ok(())
+}
+
+/// 保护路径的比较键：尽量解析真实路径（保护目录通常存在）。
+fn resolve_key(path: &Path) -> String {
+    match fs::canonicalize(path) {
+        Ok(real) => normalize(&real),
+        Err(_) => normalize(path),
+    }
 }
 
 /// 是否为盘符根（`C:\`）或 UNC 根（`\\server\share`）。
@@ -114,12 +147,17 @@ fn is_drive_root(path: &Path) -> bool {
     has_prefix && has_root && components.next().is_none()
 }
 
-/// 规范化：小写、正斜杠转反斜杠、去掉末尾分隔符（盘符根除外）。
+/// 规范化：去掉 `\\?\` / `\\?\UNC\` 前缀、小写、正斜杠转反斜杠、去掉末尾分隔符。
 fn normalize(path: &Path) -> String {
-    let mut s = path
-        .to_string_lossy()
-        .replace('/', "\\")
-        .to_ascii_lowercase();
+    let raw = path.to_string_lossy();
+    let stripped = if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        raw.into_owned()
+    };
+    let mut s = stripped.replace('/', "\\").to_ascii_lowercase();
     while s.len() > 3 && s.ends_with('\\') {
         s.pop();
     }
@@ -140,71 +178,139 @@ fn related(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
 
-    fn prot() -> Protection {
-        Protection {
-            sensitive: vec![PathBuf::from(r"C:\Windows\System32")],
-            ancestor_only: vec![
-                PathBuf::from(r"C:\Windows"),
-                PathBuf::from(r"C:\ProgramData"),
-            ],
-        }
+    /// 构造真实存在的测试目录：
+    /// `<tmp>/sensitive/`、`<tmp>/sensitive/inner/`、`<tmp>/rootdir/sub/`、`<tmp>/other/`
+    fn setup() -> (TempDir, Protection) {
+        let dir = tempfile::tempdir().unwrap();
+        let sensitive = dir.path().join("sensitive");
+        fs::create_dir_all(sensitive.join("inner")).unwrap();
+        let ancestor = dir.path().join("rootdir");
+        fs::create_dir_all(ancestor.join("sub")).unwrap();
+        fs::create_dir_all(dir.path().join("other")).unwrap();
+        let protection = Protection {
+            sensitive: vec![sensitive],
+            ancestor_only: vec![ancestor],
+        };
+        (dir, protection)
     }
 
     #[test]
     fn rejects_inside_sensitive() {
-        assert!(check_target_against(Path::new(r"C:\Windows\System32\config"), &prot()).is_err());
-        assert!(check_target_against(Path::new(r"C:\Windows\System32"), &prot()).is_err());
+        let (dir, p) = setup();
+        let target = dir.path().join("sensitive").join("inner");
+        assert!(check_target_against(&target, &p).is_err());
+        assert!(check_target_against(&dir.path().join("sensitive"), &p).is_err());
     }
 
     #[test]
     fn rejects_ancestor_of_sensitive() {
-        // C:\Windows 本身是 ancestor_only；但即使不在列表里，作为 System32 的祖先也应拒绝
-        assert!(check_target_against(Path::new(r"C:\"), &prot()).is_err());
+        let (dir, p) = setup();
+        // 临时目录根是 sensitive 的祖先
+        assert!(check_target_against(dir.path(), &p).is_err());
     }
 
     #[test]
-    fn rejects_drive_root() {
-        assert!(check_target_against(Path::new(r"C:\"), &prot()).is_err());
-        assert!(check_target_against(Path::new(r"D:\"), &prot()).is_err());
+    fn dotdot_traversal_is_resolved_and_rejected() {
+        // 回归测试（2026-11-04 审查）：`other/../sensitive` 必须被解析后拒绝
+        let (dir, p) = setup();
+        let sneaky = dir.path().join("other").join("..").join("sensitive");
+        assert!(check_target_against(&sneaky, &p).is_err());
     }
 
+    #[cfg(windows)]
     #[test]
-    fn rejects_relative() {
-        assert!(check_target_against(Path::new(r"temp"), &prot()).is_err());
+    fn verbatim_prefix_is_stripped_and_rejected() {
+        let (dir, p) = setup();
+        let verbatim = PathBuf::from(format!(r"\\?\{}", dir.path().join("sensitive").display()));
+        assert!(check_target_against(&verbatim, &p).is_err());
     }
 
+    #[cfg(windows)]
     #[test]
-    fn allows_safe_subtree_under_ancestor_only() {
-        assert!(check_target_against(Path::new(r"C:\Windows\Temp"), &prot()).is_ok());
-        assert!(
-            check_target_against(Path::new(r"C:\ProgramData\Microsoft\Windows\WER"), &prot())
-                .is_ok()
+    fn case_insensitive_comparison() {
+        let (dir, p) = setup();
+        let upper = PathBuf::from(
+            dir.path()
+                .join("sensitive")
+                .to_string_lossy()
+                .to_uppercase(),
         );
+        assert!(check_target_against(&upper, &p).is_err());
+    }
+
+    #[test]
+    fn allows_descendant_of_ancestor_only() {
+        let (dir, p) = setup();
+        assert!(check_target_against(&dir.path().join("rootdir").join("sub"), &p).is_ok());
     }
 
     #[test]
     fn rejects_purging_ancestor_only_root() {
-        assert!(check_target_against(Path::new(r"C:\ProgramData"), &prot()).is_err());
-        assert!(check_target_against(Path::new(r"C:\Windows"), &prot()).is_err());
+        let (dir, p) = setup();
+        assert!(check_target_against(&dir.path().join("rootdir"), &p).is_err());
     }
 
     #[test]
-    fn case_insensitive_and_separator_tolerant() {
-        let p = Protection {
-            sensitive: vec![PathBuf::from(r"C:\Windows\System32")],
-            ancestor_only: vec![],
-        };
-        assert!(check_target_against(Path::new(r"c:/windows/SYSTEM32/drivers"), &p).is_err());
+    fn nonexistent_target_is_allowed() {
+        // 不存在的目标没有可扫描/删除的内容；删除前会重新校验
+        let (dir, p) = setup();
+        assert!(check_target_against(&dir.path().join("not-installed"), &p).is_ok());
+    }
+
+    #[test]
+    fn rejects_drive_root() {
+        assert!(check_target_against(Path::new(r"C:\"), &Protection::default()).is_err());
+        assert!(check_target_against(Path::new(r"D:\"), &Protection::default()).is_err());
+    }
+
+    #[test]
+    fn rejects_relative() {
+        assert!(check_target_against(Path::new(r"temp"), &Protection::default()).is_err());
     }
 
     #[test]
     fn prefix_check_is_segment_based() {
+        let dir = tempfile::tempdir().unwrap();
+        let win = dir.path().join("win");
+        let win_old = dir.path().join("winOld");
+        fs::create_dir_all(&win).unwrap();
+        fs::create_dir_all(&win_old).unwrap();
         let p = Protection {
-            sensitive: vec![PathBuf::from(r"C:\Windows")],
+            sensitive: vec![win],
             ancestor_only: vec![],
         };
-        // 不能因为字符串前缀而误判 C:\WindowsOld
-        assert!(check_target_against(Path::new(r"C:\WindowsOld\Temp"), &p).is_ok());
+        // 不能因为字符串前缀而误判 winOld
+        assert!(check_target_against(&win_old, &p).is_ok());
+    }
+
+    /// 回归测试（2026-11-04 审查发现）：真实系统路径的 `..` / `\\?\` 绕过必须被拦截。
+    /// 依赖真实 Windows 环境变量；缺失时跳过。
+    #[cfg(windows)]
+    #[test]
+    fn real_system32_bypass_attempts_rejected() {
+        let Some(sysroot) = std::env::var_os("SystemRoot") else {
+            return;
+        };
+        let sysroot = PathBuf::from(sysroot);
+        let system32 = sysroot.join("System32");
+        if !system32.is_dir() {
+            return;
+        }
+        let p = protection();
+
+        // 直接命中
+        assert!(check_target_against(&system32, &p).is_err());
+        // `..` 穿越（审查时实测可绕过旧实现）：<SystemRoot>\..\<SystemRoot>\System32
+        let sneaky = sysroot
+            .join("..")
+            .join(sysroot.file_name().unwrap_or_default())
+            .join("System32");
+        assert!(check_target_against(&sneaky, &p).is_err());
+        // `\\?\` 前缀
+        let verbatim = PathBuf::from(format!(r"\\?\{}", system32.display()));
+        assert!(check_target_against(&verbatim, &p).is_err());
     }
 }

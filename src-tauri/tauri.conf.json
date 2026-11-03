@@ -26,6 +26,9 @@
   "bundle": {
     "active": true,
     "targets": "nsis",
-    "icon": ["icons/icon.ico"]
+    "icon": ["icons/icon.ico"],
+    "resources": {
+      "../rules/junk.toml": "rules/junk.toml"
+    }
   }
 }

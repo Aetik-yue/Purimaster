@@ -63,10 +63,12 @@ Purimaster/
 
 - **clientId 关联**（2026-11-03 代码审查定案）：前端在 invoke **之前**生成 clientId，
   命令与所有事件都携带它——事件先于命令返回到达也能正确关联，消除时序竞态
-- **命令**：`start_scan`（立即返回）/ `cancel_scan` / `dir_children`（按 nodeId 下钻）/
-  `list_files`（async + spawn_blocking，带条数上限，不阻塞 WebView 主线程）
-- **事件**：`scan://progress|complete|cancelled|failed`。`complete` 只携带根摘要 + 第一层
-  子目录（几 KB），更深层由 `dir_children` 按需拉取——全盘扫描不再产生几十 MB 单条载荷
+- **命令**：`start_scan`（立即返回）/ `cancel_scan`（空间/垃圾扫描共用同一取消注册表）/
+  `dir_children`（按 nodeId 下钻）/ `list_files`（async + spawn_blocking，带条数上限）/
+  `scan_junk`（规则驱动垃圾扫描，只读）/ `ipc_hello`（通路自检）
+- **事件**：`scan://progress|complete|cancelled|failed`（空间扫描）；
+  `junk://complete|cancelled`（垃圾扫描）。空间扫描的 `complete` 只携带根摘要 +
+  第一层子目录（几 KB），更深层由 `dir_children` 按需拉取——全盘扫描不再产生几十 MB 单条载荷
 - **索引驻留**：`ScanIndex`（扁平 arena：`Vec<NodeRecord>`，u32 下标、只存目录名不存
   绝对路径、构建全程迭代无递归）保存在 Tauri 壳层，仅保留最近一次扫描
 - 数据结构在 `crates/core` 定义，`serde::Serialize` 派生（`NodeSummary` 用 camelCase），

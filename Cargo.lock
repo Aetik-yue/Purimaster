@@ -2396,6 +2396,7 @@ name = "purimaster"
 version = "0.1.0"
 dependencies = [
  "purimaster-core",
+ "purimaster-rules",
  "serde",
  "serde_json",
  "tauri",
@@ -2414,6 +2415,9 @@ dependencies = [
 [[package]]
 name = "purimaster-platform"
 version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "purimaster-rules"

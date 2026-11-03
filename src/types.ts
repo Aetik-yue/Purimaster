@@ -41,3 +41,44 @@ export interface ScanCompletePayload {
   /** 根节点的直接子目录（更深层按需拉取） */
   rootChildren: NodeSummary[];
 }
+
+// ---------------------------------------------------------------------------
+// 垃圾清理（purimaster-rules）
+// ---------------------------------------------------------------------------
+
+export type Risk = "low" | "medium" | "high";
+
+/** purimaster_rules::JunkFile */
+export interface JunkFile {
+  path: string;
+  size: number;
+}
+
+/** purimaster_rules::JunkGroup */
+export interface JunkGroup {
+  ruleId: string;
+  category: string;
+  title: string;
+  risk: Risk;
+  files: number;
+  bytes: number;
+  targets: string[];
+  topFiles: JunkFile[];
+  problems: string[];
+}
+
+/** purimaster_rules::JunkScanResult */
+export interface JunkScanResult {
+  /** 分类 id → 显示名 */
+  categories: Record<string, string>;
+  groups: JunkGroup[];
+  totalFiles: number;
+  totalBytes: number;
+  skipped: number;
+}
+
+/** junk://complete 事件负载 */
+export interface JunkCompletePayload {
+  clientId: string;
+  result: JunkScanResult;
+}

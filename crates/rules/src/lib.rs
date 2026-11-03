@@ -204,12 +204,13 @@ impl RuleSet {
                 .map_err(|e| RuleError::Validation(format!("规则 `{id}` 的 exclude 非法：{e}")))?;
 
             let targets = {
-                // 同一规则内多个路径可能展开为同一目标（如 %TEMP% == %LOCALAPPDATA%\Temp），去重
-                let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+                // 同一规则内多个路径可能展开为同一目标（如 %TEMP% == %LOCALAPPDATA%\Temp），
+                // 按大小写不敏感键去重（Windows 语义）
+                let mut seen_paths: HashSet<String> = HashSet::new();
                 def.paths
                     .iter()
                     .map(|p| compile_target(p, protection))
-                    .filter(|t| seen_paths.insert(t.path.clone()))
+                    .filter(|t| seen_paths.insert(dedup_key(&t.path)))
                     .collect()
             };
 
@@ -267,7 +268,8 @@ impl RuleSet {
         let mut total_files: u64 = 0;
         let mut total_bytes: u64 = 0;
         let mut skipped: u64 = 0;
-        let mut seen: HashSet<PathBuf> = HashSet::new();
+        // 跨规则去重：大小写不敏感键（Windows 语义；联接点别名属已知限制）
+        let mut seen: HashSet<String> = HashSet::new();
 
         for rule in &self.rules {
             if cancel.load(Ordering::Relaxed) {
@@ -292,7 +294,13 @@ impl RuleSet {
                         continue;
                     }
                     // 不存在（如应用未安装）是正常情况，静默跳过
-                    Err(_) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    // 其它错误（权限、网络共享不可达等）必须让用户看见
+                    Err(e) => {
+                        problems.push(format!("{}：无法访问目标（{e}）", target.path.display()));
+                        skipped += 1;
+                        continue;
+                    }
                 }
                 used_targets.push(target.path.display().to_string());
 
@@ -302,8 +310,9 @@ impl RuleSet {
                     rule.exclude.as_ref(),
                     cancel,
                     &mut skipped,
+                    &mut problems,
                     &mut |path, size| {
-                        if !seen.insert(path.clone()) {
+                        if !seen.insert(dedup_key(&path)) {
                             return; // 已被其它规则计入
                         }
                         files += 1;
@@ -339,6 +348,7 @@ impl RuleSet {
         }
 
         Ok(JunkScanResult {
+            categories: self.categories.clone(),
             groups,
             total_files,
             total_bytes,
@@ -404,6 +414,21 @@ pub fn expand_env(input: &str) -> String {
     out
 }
 
+/// 路径去重键：大小写不敏感 + 分隔符归一（Windows 语义）。
+///
+/// 不做 `canonicalize`（每文件一次代价过高）；联接点/8.3 别名造成的重复计数
+/// 是已记录的限制，由删除阶段的目标级真实路径校验兜底。
+fn dedup_key(path: &Path) -> String {
+    let mut s = path
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    while s.len() > 3 && s.ends_with('\\') {
+        s.pop();
+    }
+    s
+}
+
 /// 递归收集目录下的文件（迭代式，无递归栈风险）。
 fn collect_files(
     root: &Path,
@@ -411,6 +436,7 @@ fn collect_files(
     exclude: Option<&GlobSet>,
     cancel: &AtomicBool,
     skipped: &mut u64,
+    problems: &mut Vec<String>,
     on_file: &mut dyn FnMut(PathBuf, u64),
 ) -> Result<(), Cancelled> {
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
@@ -420,7 +446,9 @@ fn collect_files(
         }
         let entries = match fs::read_dir(&dir) {
             Ok(e) => e,
-            Err(_) => {
+            Err(e) => {
+                // 目录存在但读不了（如 %SystemRoot%\Temp 对标准用户）：必须让用户看见
+                problems.push(format!("{}：无法读取目录（{e}）", dir.display()));
                 *skipped += 1;
                 continue;
             }
@@ -503,6 +531,8 @@ pub struct JunkGroup {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JunkScanResult {
+    /// 分类 id → 显示名（供 UI 分组）
+    pub categories: BTreeMap<String, String>,
     pub groups: Vec<JunkGroup>,
     pub total_files: u64,
     pub total_bytes: u64,

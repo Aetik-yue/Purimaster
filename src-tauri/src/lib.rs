@@ -14,19 +14,27 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use purimaster_core::{FileListing, NodeSummary, ScanError, ScanIndex, ScanProgress, scan_space};
+use purimaster_rules::RuleSet;
+use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// clientId → 取消标志
 type TaskMap = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 /// 最近一次完成的扫描索引（含其 clientId）
 type LatestIndex = Arc<Mutex<Option<(String, Arc<ScanIndex>)>>>;
+/// 清理规则集（启动时加载；加载失败时记录错误）
+type Rules = Arc<Mutex<Option<Arc<RuleSet>>>>;
 
-/// 应用状态：进行中的取消标志 + 最近一次扫描索引。
+/// 应用状态：进行中的取消标志 + 最近一次扫描索引 + 清理规则。
 /// 字段用 `Arc` 包装，便于把句柄克隆进工作线程（`State` 本身只是借用）。
 #[derive(Default)]
 struct AppState {
     tasks: TaskMap,
     latest: LatestIndex,
+    rules: Rules,
+    rules_error: Arc<Mutex<Option<String>>>,
+    /// 当前活跃的垃圾扫描 clientId（单飞：新的垃圾扫描会取消旧的，避免并发堆积）
+    junk_active: Arc<Mutex<Option<String>>>,
 }
 
 /// 统一的事件发送：失败必须可见（stderr），不允许静默吞掉。
@@ -162,6 +170,107 @@ fn dir_children(
     }
 }
 
+/// 启动一次垃圾扫描（只读）。
+///
+/// 事件（均带 `clientId`）：
+/// - `junk://complete` `{ result: JunkScanResult }`
+/// - `junk://cancelled`
+///
+/// 取消复用 `cancel_scan`（同一个取消标志注册表）。
+/// 单飞：启动新扫描会自动取消仍在运行的旧垃圾扫描。
+#[tauri::command]
+fn scan_junk(app: AppHandle, state: State<'_, AppState>, client_id: String) -> Result<(), String> {
+    if client_id.is_empty() || client_id.len() > 128 {
+        return Err("非法的 clientId".into());
+    }
+    let rules = {
+        let guard = state.rules.lock().unwrap();
+        guard.clone().ok_or_else(|| {
+            state
+                .rules_error
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "清理规则未加载".to_string())
+        })?
+    };
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let tasks = state.tasks.clone();
+    // 单飞：取消上一条仍在运行的垃圾扫描，避免切页等场景堆积并发扫描
+    {
+        let mut active = state.junk_active.lock().unwrap();
+        if let Some(prev) = active.as_ref()
+            && let Some(flag) = tasks.lock().unwrap().get(prev)
+        {
+            flag.store(true, Ordering::Relaxed);
+        }
+        *active = Some(client_id.clone());
+    }
+    tasks
+        .lock()
+        .unwrap()
+        .insert(client_id.clone(), cancel.clone());
+    let junk_active = state.junk_active.clone();
+
+    eprintln!("[purimaster] 垃圾扫描 {client_id} 启动");
+    std::thread::spawn(move || {
+        match rules.scan(&cancel) {
+            Ok(result) => {
+                eprintln!(
+                    "[purimaster] 垃圾扫描 {client_id} 完成: {} files, {} bytes",
+                    result.total_files, result.total_bytes
+                );
+                emit(
+                    &app,
+                    "junk://complete",
+                    serde_json::json!({ "clientId": client_id, "result": result }),
+                );
+            }
+            Err(_) => {
+                eprintln!("[purimaster] 垃圾扫描 {client_id} 已取消");
+                emit(
+                    &app,
+                    "junk://cancelled",
+                    serde_json::json!({ "clientId": client_id }),
+                );
+            }
+        }
+        tasks.lock().unwrap().remove(&client_id);
+        let mut active = junk_active.lock().unwrap();
+        if active.as_deref() == Some(client_id.as_str()) {
+            *active = None;
+        }
+    });
+
+    Ok(())
+}
+
+/// 解析规则目录：优先打包资源目录；开发模式（仅 debug 构建）从可执行文件向上最多找 4 层，
+/// 防止安装目录异常时误加载无关祖先目录中的 `rules/junk.toml`。
+fn resolve_rules_dir(app: &AppHandle) -> Option<std::path::PathBuf> {
+    if let Ok(dir) = app.path().resolve("rules", BaseDirectory::Resource)
+        && dir.join("junk.toml").is_file()
+    {
+        return Some(dir);
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        let exe = std::env::current_exe().ok()?;
+        let mut dir = exe.parent();
+        for _ in 0..4 {
+            let d = dir?;
+            let candidate = d.join("rules");
+            if candidate.join("junk.toml").is_file() {
+                return Some(candidate);
+            }
+            dir = d.parent();
+        }
+    }
+    None
+}
+
 /// 列出目录直属文件清单（按大小降序，最多 `limit` 条，默认 200）。
 ///
 /// async + spawn_blocking：枚举在后台线程执行，不阻塞 WebView 主线程。
@@ -179,6 +288,33 @@ async fn list_files(dir: String, limit: Option<u32>) -> Result<FileListing, Stri
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
+        .setup(|app| {
+            let state = app.state::<AppState>();
+            match resolve_rules_dir(&app.handle().clone()) {
+                Some(dir) => match RuleSet::load_dir(&dir) {
+                    Ok(set) => {
+                        eprintln!(
+                            "[purimaster] 规则加载成功（{}）：{} 条规则 / {} 个分类",
+                            dir.display(),
+                            set.rules().len(),
+                            set.categories().len()
+                        );
+                        *state.rules.lock().unwrap() = Some(Arc::new(set));
+                    }
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        eprintln!("[purimaster] 规则加载失败（{}）：{msg}", dir.display());
+                        *state.rules_error.lock().unwrap() = Some(msg);
+                    }
+                },
+                None => {
+                    let msg = "未找到规则目录（rules/junk.toml）".to_string();
+                    eprintln!("[purimaster] {msg}");
+                    *state.rules_error.lock().unwrap() = Some(msg);
+                }
+            }
+            Ok(())
+        })
         .on_window_event(|window, event| {
             // 关闭窗口时统一发出取消信号，避免扫描线程在退出期间继续阻塞
             if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
@@ -193,6 +329,7 @@ pub fn run() {
             cancel_scan,
             dir_children,
             list_files,
+            scan_junk,
             ipc_hello
         ])
         .run(tauri::generate_context!())
