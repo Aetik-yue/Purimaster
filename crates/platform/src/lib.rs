@@ -24,6 +24,10 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
+pub mod delete;
+
+pub use delete::{DeleteError, DeleteMode, delete_file};
+
 /// 保护路径配置。
 #[derive(Debug, Clone, Default)]
 pub struct Protection {
@@ -52,8 +56,24 @@ fn sensitive_roots() -> Vec<PathBuf> {
             roots.push(p);
         }
     }
+
+    // 个人文件目录：绝不作为清理目标（宁可少清不可误删）。
+    // 优先使用 Known Folder API（dirs），覆盖 OneDrive 文件夹迁移/重定向的情况；
+    // 若 Known Folder 不可用，退回 %USERPROFILE%\固定名 字面路径。
+    for folder in [
+        dirs::document_dir(),
+        dirs::download_dir(),
+        dirs::desktop_dir(),
+        dirs::picture_dir(),
+        dirs::video_dir(),
+        dirs::audio_dir(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        push_unique(&mut roots, folder);
+    }
     if let Some(user) = env_path("USERPROFILE") {
-        // 个人文件目录：绝不作为清理目标（下载目录同样保护，宁可少清不可误删）
         for sub in [
             "Documents",
             "Desktop",
@@ -63,22 +83,47 @@ fn sensitive_roots() -> Vec<PathBuf> {
             "Downloads",
             "Favorites",
         ] {
-            roots.push(user.join(sub));
+            push_unique(&mut roots, user.join(sub));
         }
     }
+
+    // OneDrive 同步目录（删除会同步到云端，必须保护）
+    for var in ["OneDrive", "OneDriveCommercial", "OneDriveConsumer"] {
+        if let Some(p) = env_path(var) {
+            push_unique(&mut roots, p);
+        }
+    }
+    if let Some(user) = env_path("USERPROFILE") {
+        push_unique(&mut roots, user.join("OneDrive"));
+    }
+
     roots
 }
 
 fn ancestor_only_roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
-    // 整个系统目录/程序数据目录/用户目录不允许被整体清除，
-    // 但其内部的具体缓存目录（Temp、SoftwareDistribution\Download 等）可以作为目标
-    for var in ["SystemRoot", "WINDIR", "ProgramData", "USERPROFILE"] {
+    // 整个系统目录/程序数据目录/用户目录/应用数据目录不允许被整体清除，
+    // 但其内部的具体缓存目录（Temp、SoftwareDistribution\Download、浏览器缓存等）可以作为目标
+    for var in [
+        "SystemRoot",
+        "WINDIR",
+        "ProgramData",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+    ] {
         if let Some(p) = env_path(var) {
-            roots.push(p);
+            push_unique(&mut roots, p);
         }
     }
     roots
+}
+
+fn push_unique(roots: &mut Vec<PathBuf>, path: PathBuf) {
+    let key = normalize(&path);
+    if !roots.iter().any(|p| normalize(p) == key) {
+        roots.push(path);
+    }
 }
 
 fn env_path(var: &str) -> Option<PathBuf> {

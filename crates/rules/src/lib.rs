@@ -16,6 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
+/// 删除方式（转发自 platform，便于壳层与测试直接使用）
+pub use purimaster_platform::DeleteMode;
+
 /// 每条规则最多预置多少条最大文件预览（避免 IPC 载荷过大）。
 const PREVIEW_LIMIT: usize = 50;
 
@@ -501,8 +504,200 @@ fn collect_files(
 }
 
 // ---------------------------------------------------------------------------
-// 扫描结果（IPC 友好，camelCase）
+// 清理（删除）——ADR-0003：删除时重新枚举、逐文件重校验、逐文件结果上报
 // ---------------------------------------------------------------------------
+
+/// 清理选项。
+#[derive(Debug, Clone, Copy)]
+pub struct CleanOptions {
+    pub mode: purimaster_platform::DeleteMode,
+    /// 只做全部安全检查，不实际删除
+    pub dry_run: bool,
+}
+
+/// 单个失败文件（`failed` 列表最多保留 [`FAILED_PREVIEW`] 条，计数见 `failed_count`）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanFileFailure {
+    pub path: String,
+    pub error: String,
+}
+
+/// 清理报告。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanReport {
+    pub dry_run: bool,
+    /// `"trash"`（回收站）或 `"permanent"`（永久删除）
+    pub mode: &'static str,
+    /// 已删除（或 dry-run 下"将删除"）的文件数
+    pub deleted_files: u64,
+    /// 移入回收站/删除的文件总字节数。
+    /// 注意：回收站模式下需清空回收站后才真正释放磁盘空间。
+    pub freed_bytes: u64,
+    pub failed_count: u64,
+    pub failed: Vec<CleanFileFailure>,
+    /// 因读取失败/目标异常而跳过的条目数
+    pub skipped: u64,
+    /// 被跳过/拒绝的规则或目标说明
+    pub skipped_rules: Vec<String>,
+    /// 是否因取消而提前结束（已完成的部分仍计入报告）
+    pub cancelled: bool,
+}
+
+/// `failed` 列表最多保留多少条明细
+const FAILED_PREVIEW: usize = 100;
+
+impl RuleSet {
+    /// 按规则 id 清理垃圾文件。
+    ///
+    /// - 删除前**重新枚举**规则目标并**重新校验**（ADR-0003，不信任扫描结果）
+    /// - 归属计算与 `scan` 一致：按规则顺序全局去重，保证实际删除量不超过确认弹窗的统计
+    /// - 单个文件失败不中断，计入 `failed`
+    /// - 取消会提前结束，已完成的部分保留在报告中（`cancelled = true`）
+    pub fn clean(
+        &self,
+        rule_ids: &[String],
+        cancel: &AtomicBool,
+        options: CleanOptions,
+    ) -> CleanReport {
+        let mut report = CleanReport {
+            dry_run: options.dry_run,
+            mode: options.mode.as_str(),
+            deleted_files: 0,
+            freed_bytes: 0,
+            failed_count: 0,
+            failed: Vec::new(),
+            skipped: 0,
+            skipped_rules: Vec::new(),
+            cancelled: false,
+        };
+        if rule_ids.is_empty() {
+            return report;
+        }
+
+        let known: std::collections::HashSet<&str> =
+            self.rules.iter().map(|r| r.id.as_str()).collect();
+        // 未知规则 id 在开始前一次性报告（与取消无关，避免取消后误报）
+        for id in rule_ids {
+            if !known.contains(id.as_str()) {
+                report.skipped_rules.push(format!("{id}：规则不存在"));
+            }
+        }
+
+        let selected: std::collections::HashSet<&str> =
+            rule_ids.iter().map(String::as_str).collect();
+        // 归属去重与 scan 保持一致：所有规则按顺序参与，未选中的规则只参与"认领"不删除
+        let mut seen: HashSet<String> = HashSet::new();
+
+        'rules: for rule in &self.rules {
+            let is_selected = selected.contains(rule.id.as_str());
+            for target in &rule.targets {
+                if cancel.load(Ordering::Relaxed) {
+                    report.cancelled = true;
+                    break 'rules;
+                }
+                if let Some(problem) = &target.problem {
+                    if is_selected {
+                        report.skipped_rules.push(format!("{}：{problem}", rule.id));
+                    }
+                    continue;
+                }
+                // 目标身份校验：必须仍是普通目录，且不能是链接/联接点
+                match fs::symlink_metadata(&target.path) {
+                    Ok(m) if m.file_type().is_symlink() => {
+                        if is_selected {
+                            report
+                                .skipped_rules
+                                .push(format!("{}：目标本身是链接或联接点，拒绝清理", rule.id));
+                            report.skipped += 1;
+                        }
+                        continue;
+                    }
+                    Ok(m) if m.is_dir() => {}
+                    Ok(_) => {
+                        if is_selected {
+                            report
+                                .skipped_rules
+                                .push(format!("{}：目标不是目录", rule.id));
+                            report.skipped += 1;
+                        }
+                        continue;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        if is_selected {
+                            report
+                                .skipped_rules
+                                .push(format!("{}：无法访问目标（{e}）", rule.id));
+                            report.skipped += 1;
+                        }
+                        continue;
+                    }
+                }
+                // 删除时重新校验目标（防止扫描后目标被替换/篡改）
+                if is_selected && let Err(e) = purimaster_platform::check_target(&target.path) {
+                    report.skipped_rules.push(format!("{}：{e}", rule.id));
+                    report.skipped += 1;
+                    continue;
+                }
+
+                let mut skipped = 0u64;
+                let mut problems: Vec<String> = Vec::new();
+                let walk = collect_files(
+                    &target.path,
+                    rule.include.as_ref(),
+                    rule.exclude.as_ref(),
+                    cancel,
+                    &mut skipped,
+                    &mut problems,
+                    &mut |path, _size| {
+                        if !seen.insert(dedup_key(&path)) {
+                            return;
+                        }
+                        // 未选中的规则只参与归属计算，不执行删除
+                        if !is_selected {
+                            return;
+                        }
+                        match purimaster_platform::delete_file(
+                            &target.path,
+                            &path,
+                            options.mode,
+                            options.dry_run,
+                        ) {
+                            Ok(size) => {
+                                report.deleted_files += 1;
+                                report.freed_bytes += size;
+                            }
+                            Err(e) => {
+                                report.failed_count += 1;
+                                if report.failed.len() < FAILED_PREVIEW {
+                                    report.failed.push(CleanFileFailure {
+                                        path: path.display().to_string(),
+                                        error: e.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    },
+                );
+                // 无论是否取消都回写跳过/问题信息，避免报告丢失现场
+                if is_selected {
+                    report.skipped += skipped;
+                    for p in problems {
+                        report.skipped_rules.push(format!("{}：{p}", rule.id));
+                    }
+                }
+                if walk.is_err() {
+                    report.cancelled = true;
+                    break 'rules;
+                }
+            }
+        }
+
+        report
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -962,5 +1157,261 @@ include_paths = ["typo"]
         let err =
             RuleSet::from_toml_strs_with_protection(&[toml], &Protection::default()).unwrap_err();
         assert!(matches!(err, RuleError::Toml(_)), "实际错误：{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // 清理（删除）测试 —— ADR-0003
+    // -----------------------------------------------------------------------
+
+    fn clean_opts(mode: purimaster_platform::DeleteMode, dry_run: bool) -> CleanOptions {
+        CleanOptions { mode, dry_run }
+    }
+
+    fn junk_set(dir: &Path) -> (RuleSet, std::path::PathBuf) {
+        let junk = dir.join("junk");
+        fs::create_dir(&junk).unwrap();
+        let toml = rule_toml(&tomldir(&junk), None, None);
+        let set =
+            RuleSet::from_toml_strs_with_protection(&[&toml], &Protection::default()).unwrap();
+        (set, junk)
+    }
+
+    #[test]
+    fn clean_dry_run_keeps_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let (set, junk) = junk_set(dir.path());
+        fs::write(junk.join("a.bin"), [0u8; 10]).unwrap();
+        fs::write(junk.join("b.bin"), [0u8; 20]).unwrap();
+
+        let report = set.clean(
+            &["test-rule".to_string()],
+            &AtomicBool::new(false),
+            clean_opts(purimaster_platform::DeleteMode::Permanent, true),
+        );
+        assert!(report.dry_run);
+        assert_eq!(report.deleted_files, 2);
+        assert_eq!(report.freed_bytes, 30);
+        assert!(!report.cancelled);
+        assert!(junk.join("a.bin").exists(), "dry-run 不得删除文件");
+        assert!(junk.join("b.bin").exists());
+    }
+
+    #[test]
+    fn clean_permanent_removes_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let (set, junk) = junk_set(dir.path());
+        fs::write(junk.join("a.bin"), [0u8; 10]).unwrap();
+        fs::write(junk.join("b.bin"), [0u8; 20]).unwrap();
+
+        let report = set.clean(
+            &["test-rule".to_string()],
+            &AtomicBool::new(false),
+            clean_opts(purimaster_platform::DeleteMode::Permanent, false),
+        );
+        assert_eq!(report.deleted_files, 2);
+        assert_eq!(report.freed_bytes, 30);
+        assert!(!junk.join("a.bin").exists());
+        assert!(!junk.join("b.bin").exists());
+    }
+
+    #[test]
+    fn clean_unknown_rule_id_is_reported() {
+        let set = RuleSet::default();
+        let report = set.clean(
+            &["nope".to_string()],
+            &AtomicBool::new(false),
+            clean_opts(purimaster_platform::DeleteMode::Trash, true),
+        );
+        assert_eq!(report.deleted_files, 0);
+        assert!(
+            report
+                .skipped_rules
+                .iter()
+                .any(|s| s.contains("规则不存在"))
+        );
+    }
+
+    #[test]
+    fn clean_cancelled_before_start_deletes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (set, junk) = junk_set(dir.path());
+        fs::write(junk.join("a.bin"), [0u8; 10]).unwrap();
+
+        let report = set.clean(
+            &["test-rule".to_string()],
+            &AtomicBool::new(true),
+            clean_opts(purimaster_platform::DeleteMode::Permanent, false),
+        );
+        assert!(report.cancelled);
+        assert_eq!(report.deleted_files, 0);
+        assert!(junk.join("a.bin").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clean_failure_does_not_abort_batch() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (set, junk) = junk_set(dir.path());
+        // 以 share_mode(0) 独占打开：模拟被占用文件，删除时会产生共享冲突
+        let locked = junk.join("locked.bin");
+        fs::write(&locked, [0u8; 5]).unwrap();
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&locked)
+            .unwrap();
+        fs::write(junk.join("ok.bin"), [0u8; 7]).unwrap();
+
+        let report = set.clean(
+            &["test-rule".to_string()],
+            &AtomicBool::new(false),
+            clean_opts(purimaster_platform::DeleteMode::Permanent, false),
+        );
+        // 正常文件被删除，被占用文件失败但不中断整批
+        assert_eq!(report.deleted_files, 1);
+        assert_eq!(report.failed_count, 1);
+        assert!(!report.failed.is_empty());
+        assert!(locked.exists());
+
+        drop(handle);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clean_rejects_protected_target() {
+        if std::env::var_os("SystemRoot").is_none() {
+            return;
+        }
+        let toml = r#"
+[categories]
+temp = "临时文件"
+
+[[rule]]
+id = "evil"
+category = "temp"
+title = "恶意规则"
+paths = ['%SystemRoot%\System32']
+"#;
+        let set = RuleSet::from_toml_strs(&[toml]).unwrap();
+        let report = set.clean(
+            &["evil".to_string()],
+            &AtomicBool::new(false),
+            clean_opts(purimaster_platform::DeleteMode::Permanent, true),
+        );
+        assert_eq!(report.deleted_files, 0);
+        assert!(
+            report.skipped_rules.iter().any(|s| s.contains("受保护")),
+            "实际：{:?}",
+            report.skipped_rules
+        );
+    }
+
+    #[test]
+    fn clean_subset_matches_scan_attribution() {
+        // 审查发现：子集清理时不能删除"扫描时归属其它规则"的文件（确认数字才可信）
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("junk");
+        fs::create_dir(&junk).unwrap();
+        fs::write(junk.join("a.log"), [0u8; 10]).unwrap();
+        fs::write(junk.join("b.txt"), [0u8; 20]).unwrap();
+
+        let toml = format!(
+            r#"
+[categories]
+temp = "临时文件"
+
+[[rule]]
+id = "logs"
+category = "temp"
+title = "日志"
+paths = [{p}]
+include = ["**/*.log"]
+
+[[rule]]
+id = "rest"
+category = "temp"
+title = "其余"
+paths = [{p}]
+"#,
+            p = tomldir(&junk)
+        );
+        let set =
+            RuleSet::from_toml_strs_with_protection(&[&toml], &Protection::default()).unwrap();
+
+        let scan = scan_with(&set);
+        let rest_group = scan.groups.iter().find(|g| g.rule_id == "rest").unwrap();
+        assert_eq!(rest_group.files, 1, "a.log 应归属 logs，rest 只认领 b.txt");
+
+        // 只选 rest：只应删除 b.txt，a.log 属于未选中的 logs
+        let report = set.clean(
+            &["rest".to_string()],
+            &AtomicBool::new(false),
+            clean_opts(purimaster_platform::DeleteMode::Permanent, false),
+        );
+        assert_eq!(report.deleted_files, 1);
+        assert!(junk.join("a.log").exists());
+        assert!(!junk.join("b.txt").exists());
+    }
+
+    #[test]
+    fn cancelled_clean_does_not_misreport_rules() {
+        let toml = r#"
+[categories]
+temp = "临时文件"
+
+[[rule]]
+id = "r1"
+category = "temp"
+title = "R1"
+paths = ["C:\\__purimaster_no_such_a__"]
+
+[[rule]]
+id = "r2"
+category = "temp"
+title = "R2"
+paths = ["C:\\__purimaster_no_such_b__"]
+"#;
+        let set = RuleSet::from_toml_strs_with_protection(&[toml], &Protection::default()).unwrap();
+        let report = set.clean(
+            &["r1".to_string(), "r2".to_string()],
+            &AtomicBool::new(true),
+            clean_opts(purimaster_platform::DeleteMode::Trash, true),
+        );
+        assert!(report.cancelled);
+        assert!(
+            !report
+                .skipped_rules
+                .iter()
+                .any(|s| s.contains("规则不存在")),
+            "取消不应把存在的规则误报为不存在：{:?}",
+            report.skipped_rules
+        );
+    }
+
+    #[test]
+    fn clean_reports_non_directory_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir.txt");
+        fs::write(&file, [0u8; 3]).unwrap();
+        let toml = rule_toml(&tomldir(&file), None, None);
+        let set =
+            RuleSet::from_toml_strs_with_protection(&[&toml], &Protection::default()).unwrap();
+        let report = set.clean(
+            &["test-rule".to_string()],
+            &AtomicBool::new(false),
+            clean_opts(purimaster_platform::DeleteMode::Permanent, true),
+        );
+        assert_eq!(report.deleted_files, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(
+            report
+                .skipped_rules
+                .iter()
+                .any(|s| s.contains("目标不是目录")),
+            "实际：{:?}",
+            report.skipped_rules
+        );
     }
 }

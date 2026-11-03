@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use purimaster_core::{FileListing, NodeSummary, ScanError, ScanIndex, ScanProgress, scan_space};
-use purimaster_rules::RuleSet;
+use purimaster_rules::{CleanOptions, CleanReport, DeleteMode, RuleSet};
 use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -35,6 +35,8 @@ struct AppState {
     rules_error: Arc<Mutex<Option<String>>>,
     /// 当前活跃的垃圾扫描 clientId（单飞：新的垃圾扫描会取消旧的，避免并发堆积）
     junk_active: Arc<Mutex<Option<String>>>,
+    /// 最近一次清理报告：清理期间切换页签后，重新进入页面可取回（逐文件结果不丢失）
+    last_clean: Arc<Mutex<Option<CleanReport>>>,
 }
 
 /// 统一的事件发送：失败必须可见（stderr），不允许静默吞掉。
@@ -246,6 +248,84 @@ fn scan_junk(app: AppHandle, state: State<'_, AppState>, client_id: String) -> R
     Ok(())
 }
 
+/// 清理选中的规则（ADR-0003：删除时重新枚举并逐文件重校验）。
+///
+/// 事件：`clean://complete` `{ report: CleanReport }`。
+/// `permanent=false` 时移入回收站（默认）；`dry_run=true` 时只做安全检查不删除。
+/// 报告中的 `report.cancelled` 表示被取消（已完成部分仍计入报告）。
+///
+/// 取消复用 `cancel_scan`。
+#[tauri::command]
+fn clean_junk(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    client_id: String,
+    rule_ids: Vec<String>,
+    permanent: bool,
+    dry_run: bool,
+) -> Result<(), String> {
+    if client_id.is_empty() || client_id.len() > 128 {
+        return Err("非法的 clientId".into());
+    }
+    if rule_ids.is_empty() {
+        return Err("未选择任何清理规则".into());
+    }
+    let rules = {
+        let guard = state.rules.lock().unwrap();
+        guard.clone().ok_or_else(|| {
+            state
+                .rules_error
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "清理规则未加载".to_string())
+        })?
+    };
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let tasks = state.tasks.clone();
+    tasks
+        .lock()
+        .unwrap()
+        .insert(client_id.clone(), cancel.clone());
+
+    let mode = if permanent {
+        DeleteMode::Permanent
+    } else {
+        DeleteMode::Trash
+    };
+    eprintln!(
+        "[purimaster] 清理 {client_id} 启动: rules={rule_ids:?}, mode={mode:?}, dry_run={dry_run}"
+    );
+    let last_clean = state.last_clean.clone();
+    std::thread::spawn(move || {
+        let report = rules.clean(&rule_ids, &cancel, CleanOptions { mode, dry_run });
+        eprintln!(
+            "[purimaster] 清理 {client_id} 完成: deleted={} failed={} cancelled={}",
+            report.deleted_files, report.failed_count, report.cancelled
+        );
+        // 先持久化报告：即使前端已切页/监听已注销，重新进入页面仍能取回
+        *last_clean.lock().unwrap() = Some(report.clone());
+        emit(
+            &app,
+            "clean://complete",
+            serde_json::json!({ "clientId": client_id, "report": report }),
+        );
+        tasks.lock().unwrap().remove(&client_id);
+    });
+
+    Ok(())
+}
+
+/// 取走最近一次清理报告（取回后清空，避免重复弹出）。
+///
+/// 用于清理期间切换页签的场景：清理不在切页时取消（用户已确认删除），
+/// 报告由下次挂载的页面通过本命令取回。
+#[tauri::command]
+fn take_clean_report(state: State<'_, AppState>) -> Option<CleanReport> {
+    state.last_clean.lock().unwrap().take()
+}
+
 /// 解析规则目录：优先打包资源目录；开发模式（仅 debug 构建）从可执行文件向上最多找 4 层，
 /// 防止安装目录异常时误加载无关祖先目录中的 `rules/junk.toml`。
 fn resolve_rules_dir(app: &AppHandle) -> Option<std::path::PathBuf> {
@@ -330,6 +410,8 @@ pub fn run() {
             dir_children,
             list_files,
             scan_junk,
+            clean_junk,
+            take_clean_report,
             ipc_hello
         ])
         .run(tauri::generate_context!())

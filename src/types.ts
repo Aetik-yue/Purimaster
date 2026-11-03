@@ -82,3 +82,29 @@ export interface JunkCompletePayload {
   clientId: string;
   result: JunkScanResult;
 }
+
+/** purimaster_rules::CleanFileFailure */
+export interface CleanFileFailure {
+  path: string;
+  error: string;
+}
+
+/** purimaster_rules::CleanReport */
+export interface CleanReport {
+  dryRun: boolean;
+  mode: "trash" | "permanent";
+  deletedFiles: number;
+  freedBytes: number;
+  failedCount: number;
+  failed: CleanFileFailure[];
+  /** 因读取失败/目标异常而跳过的条目数 */
+  skipped: number;
+  skippedRules: string[];
+  cancelled: boolean;
+}
+
+/** clean://complete 事件负载 */
+export interface CleanCompletePayload {
+  clientId: string;
+  report: CleanReport;
+}
