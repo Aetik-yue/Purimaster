@@ -1,0 +1,7 @@
+[package]
+name = "purimaster-platform"
+version = "0.1.0"
+edition = "2024"
+description = "Purimaster 平台特化逻辑：系统关键路径保护（硬编码，不随规则数据变化）"
+
+[dependencies]

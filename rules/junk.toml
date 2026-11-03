@@ -1,0 +1,93 @@
+# Purimaster 清理规则（MVP）
+#
+# 规则即数据（ADR-0002）：修改本文件无需重新编译。
+# 系统关键路径保护硬编码在 crates/platform，即使本文件被篡改也不会触碰系统/个人文件。
+#
+# 约定：
+# - paths 支持 %VAR% 环境变量（Windows 约定），路径必须展开为绝对路径
+# - include 为空表示包含全部；exclude 优先于 include
+# - glob 相对目标目录、`/` 分隔、大小写不敏感
+# - risk: low | medium | high（UI 据此决定清理时的确认强度）
+# - 目标不存在（应用未安装等）会被静默跳过
+
+[categories]
+temp = "临时文件"
+browser-cache = "浏览器缓存"
+system-residue = "系统残留"
+crash-dump = "崩溃转储"
+
+[[rule]]
+id = "user-temp"
+category = "temp"
+title = "用户临时目录"
+risk = "low"
+paths = [
+  '%TEMP%',
+  '%LOCALAPPDATA%\Temp',
+]
+
+[[rule]]
+id = "system-temp"
+category = "temp"
+title = "系统临时目录"
+risk = "low"
+paths = ['%SystemRoot%\Temp']
+
+[[rule]]
+id = "chrome-cache"
+category = "browser-cache"
+title = "Chrome 缓存"
+risk = "low"
+# 注：MVP 只覆盖 Default Profile，后续版本遍历 User Data 下所有 Profile
+paths = [
+  '%LOCALAPPDATA%\Google\Chrome\User Data\Default\Cache',
+  '%LOCALAPPDATA%\Google\Chrome\User Data\Default\Code Cache',
+  '%LOCALAPPDATA%\Google\Chrome\User Data\Default\GPUCache',
+]
+
+[[rule]]
+id = "edge-cache"
+category = "browser-cache"
+title = "Edge 缓存"
+risk = "low"
+paths = [
+  '%LOCALAPPDATA%\Microsoft\Edge\User Data\Default\Cache',
+  '%LOCALAPPDATA%\Microsoft\Edge\User Data\Default\Code Cache',
+  '%LOCALAPPDATA%\Microsoft\Edge\User Data\Default\GPUCache',
+]
+
+[[rule]]
+id = "windows-update-download"
+category = "system-residue"
+title = "Windows 更新下载缓存"
+risk = "medium"
+# 内容可重新下载；清理前应确认更新服务空闲（v0.1 阶段只扫描不删除）
+paths = ['%SystemRoot%\SoftwareDistribution\Download']
+
+[[rule]]
+id = "wer-reports"
+category = "system-residue"
+title = "Windows 错误报告"
+risk = "low"
+paths = [
+  '%LOCALAPPDATA%\Microsoft\Windows\WER\ReportArchive',
+  '%LOCALAPPDATA%\Microsoft\Windows\WER\ReportQueue',
+  '%ProgramData%\Microsoft\Windows\WER\ReportArchive',
+  '%ProgramData%\Microsoft\Windows\WER\ReportQueue',
+]
+
+[[rule]]
+id = "thumbnail-cache"
+category = "system-residue"
+title = "缩略图/图标缓存"
+risk = "low"
+# Explorer 目录下只命中缓存文件，不清理其它数据
+paths = ['%LOCALAPPDATA%\Microsoft\Windows\Explorer']
+include = ['thumbcache_*.db', 'iconcache_*.db']
+
+[[rule]]
+id = "crash-dumps"
+category = "crash-dump"
+title = "应用崩溃转储"
+risk = "low"
+paths = ['%LOCALAPPDATA%\CrashDumps']

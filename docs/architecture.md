@@ -50,7 +50,7 @@ Purimaster/
 | `trash` | 移入回收站（跨实现一致） |
 | `windows` / `windows-sys` | Win32 API（系统路径、卷信息；后期 MFT） |
 | `blake3` | 内容哈希（快速、128 位以上安全裕度） |
-| `serde` + `toml` | 规则文件与 IPC 数据序列化 |
+| `serde` + `toml` + `globset` | 规则文件、IPC 序列化、规则 glob 匹配 |
 | `tracing` | 结构化日志 |
 
 > **为什么不用 jwalk**（2026-11-03 实测）：jwalk 的 `DirEntry::metadata()` 每文件一次额外
