@@ -12,9 +12,12 @@ import type {
   Risk,
 } from "../types";
 
+// 会话级缓存：切页回来直接显示上次结果，不重复扫描（清理时后端会重新枚举，显示值略旧是安全的）
+let sessionCache: JunkScanResult | null = null;
+
 const scanning = ref(false);
 const cleaning = ref(false);
-const result = ref<JunkScanResult | null>(null);
+const result = ref<JunkScanResult | null>(sessionCache);
 const error = ref("");
 const expanded = ref<Set<string>>(new Set());
 /** 已勾选的规则 id */
@@ -97,6 +100,7 @@ onMounted(async () => {
     await onEvent<JunkCompletePayload>("junk://complete", (payload) => {
       if (payload.clientId !== clientId) return;
       result.value = payload.result;
+      sessionCache = payload.result;
       scanning.value = false;
     });
     await onEvent<{ clientId: string }>("junk://cancelled", (payload) => {
@@ -114,7 +118,6 @@ onMounted(async () => {
     error.value = `事件监听注册失败：${err}`;
     return;
   }
-  // 进入页面自动扫描一次（组件已卸载则跳过）
   if (disposed) return;
 
   // 清理在切页后仍会完成：取回上次未查看的报告，避免逐文件结果丢失
@@ -127,7 +130,9 @@ onMounted(async () => {
   } catch {
     // 报告恢复失败不影响主流程
   }
-  if (!disposed) startScan();
+
+  // 没有缓存结果才自动扫描；有缓存直接展示（用户可手动重新扫描）
+  if (!disposed && sessionCache === null) startScan();
 });
 
 onUnmounted(() => {
@@ -142,6 +147,7 @@ async function startScan() {
   if (cleaning.value) return;
   error.value = "";
   result.value = null;
+  sessionCache = null;
   expanded.value = new Set();
   selected.value = new Set();
   const id = genId();
@@ -188,6 +194,20 @@ function toggleSelectAll() {
   } else {
     selected.value = new Set(selectableGroups.value.map((g) => g.ruleId));
   }
+}
+
+/** 直接清理单个规则（行内按钮） */
+function cleanSingle(ruleId: string) {
+  if (cleaning.value || scanning.value) return;
+  selected.value = new Set([ruleId]);
+  openConfirm();
+}
+
+/** 一键清理全部（进入确认弹窗后仍可选择回收站/试运行） */
+function cleanAll() {
+  if (cleaning.value || scanning.value) return;
+  selected.value = new Set(selectableGroups.value.map((g) => g.ruleId));
+  openConfirm();
 }
 
 /** 打开确认弹窗：每次都重置为安全默认（回收站、非试运行） */
@@ -241,17 +261,29 @@ function groupTargetsSummary(group: JunkGroup): string {
       <button v-else-if="cleaning" class="danger" @click="cancelCleaning">取消清理</button>
       <button v-else class="primary" @click="startScan">重新扫描</button>
       <span v-if="cleaning" class="status">正在清理…</span>
+      <span v-else-if="result && !scanning" class="hint">
+        勾选项目后点「清理选中」，或直接点某一行右侧的「清理」；不确定就先勾「仅试运行」看效果
+      </span>
     </div>
 
     <p v-if="scanning" class="status">正在扫描垃圾文件…</p>
     <p v-if="error" class="error">{{ error }}</p>
 
     <div v-if="result" class="result">
-      <p class="summary">
-        共发现 <strong>{{ humanCount(result.totalFiles) }}</strong> 个可清理文件，合计
-        <strong>{{ humanSize(result.totalBytes) }}</strong>
-        <span v-if="result.skipped > 0"> · 跳过 {{ humanCount(result.skipped) }} 项</span>
-      </p>
+      <div class="summary-bar">
+        <p class="summary">
+          共发现 <strong>{{ humanCount(result.totalFiles) }}</strong> 个可清理文件，合计
+          <strong>{{ humanSize(result.totalBytes) }}</strong>
+          <span v-if="result.skipped > 0"> · 跳过 {{ humanCount(result.skipped) }} 项</span>
+        </p>
+        <button
+          class="primary big"
+          :disabled="selectableGroups.length === 0 || cleaning || scanning"
+          @click="cleanAll"
+        >
+          一键清理全部
+        </button>
+      </div>
 
       <p v-if="result.totalFiles === 0 && !scanning" class="empty">未发现可清理的垃圾文件 ✓</p>
 
@@ -271,6 +303,7 @@ function groupTargetsSummary(group: JunkGroup): string {
         <button
           class="primary"
           :disabled="selectedFiles === 0 || cleaning || scanning"
+          :title="selectedFiles === 0 ? '请先勾选要清理的项目' : ''"
           @click="openConfirm"
         >
           清理选中
@@ -304,6 +337,15 @@ function groupTargetsSummary(group: JunkGroup): string {
               <span class="group-meta">
                 {{ humanCount(g.files) }} 文件 · {{ humanSize(g.bytes) }}
               </span>
+              <button
+                v-if="g.files > 0"
+                class="mini-clean"
+                :disabled="cleaning || scanning"
+                title="只清理这一项"
+                @click.stop="cleanSingle(g.ruleId)"
+              >
+                清理
+              </button>
             </div>
 
             <div v-if="expanded.has(g.ruleId)" class="group-detail">
@@ -414,6 +456,11 @@ function groupTargetsSummary(group: JunkGroup): string {
   color: var(--accent);
 }
 
+.hint {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
 .error {
   color: var(--danger);
 }
@@ -426,13 +473,25 @@ function groupTargetsSummary(group: JunkGroup): string {
   gap: 8px;
 }
 
+.summary-bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
 .summary {
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
+  margin-right: auto;
 }
 
 .summary strong {
   color: var(--text);
+}
+
+button.big {
+  padding: 9px 22px;
+  font-size: 14px;
 }
 
 .empty {
@@ -499,7 +558,7 @@ function groupTargetsSummary(group: JunkGroup): string {
   display: flex;
   align-items: center;
   gap: 8px;
-  height: 34px;
+  height: 36px;
   padding: 0 8px;
   border-radius: 6px;
   cursor: pointer;
@@ -556,6 +615,19 @@ function groupTargetsSummary(group: JunkGroup): string {
   font-size: 12px;
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
+}
+
+.mini-clean {
+  flex-shrink: 0;
+  padding: 3px 12px;
+  font-size: 12px;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 5px;
+}
+
+.mini-clean:hover {
+  background: var(--accent-hover);
 }
 
 .group-detail {
