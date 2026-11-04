@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use purimaster_core::{FileListing, NodeSummary, ScanError, ScanIndex, ScanProgress, scan_space};
-use purimaster_rules::{CleanOptions, CleanReport, DeleteMode, RuleSet};
+use purimaster_rules::{CleanOptions, CleanReport, DeleteMode, JunkScanResult, RuleSet};
 use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -35,6 +35,8 @@ struct AppState {
     rules_error: Arc<Mutex<Option<String>>>,
     /// 当前活跃的垃圾扫描 clientId（单飞：新的垃圾扫描会取消旧的，避免并发堆积）
     junk_active: Arc<Mutex<Option<String>>>,
+    /// 最近一次完成的垃圾扫描结果：切页不取消扫描，重新进入页面时取回展示
+    junk_cache: Arc<Mutex<Option<JunkScanResult>>>,
     /// 最近一次清理报告：清理期间切换页签后，重新进入页面可取回（逐文件结果不丢失）
     last_clean: Arc<Mutex<Option<CleanReport>>>,
 }
@@ -216,6 +218,7 @@ fn scan_junk(app: AppHandle, state: State<'_, AppState>, client_id: String) -> R
     let junk_active = state.junk_active.clone();
 
     eprintln!("[purimaster] 垃圾扫描 {client_id} 启动");
+    let junk_cache = state.junk_cache.clone();
     std::thread::spawn(move || {
         match rules.scan(&cancel) {
             Ok(result) => {
@@ -223,6 +226,8 @@ fn scan_junk(app: AppHandle, state: State<'_, AppState>, client_id: String) -> R
                     "[purimaster] 垃圾扫描 {client_id} 完成: {} files, {} bytes",
                     result.total_files, result.total_bytes
                 );
+                // 持久化到缓存：即使前端已切页（事件无人接收），重新进入页面也能取回
+                *junk_cache.lock().unwrap() = Some(result.clone());
                 emit(
                     &app,
                     "junk://complete",
@@ -246,6 +251,12 @@ fn scan_junk(app: AppHandle, state: State<'_, AppState>, client_id: String) -> R
     });
 
     Ok(())
+}
+
+/// 取回最近一次完成的垃圾扫描结果（只读，不清空；随下次扫描完成而更新）。
+#[tauri::command]
+fn get_junk_cache(state: State<'_, AppState>) -> Option<JunkScanResult> {
+    state.junk_cache.lock().unwrap().clone()
 }
 
 /// 清理选中的规则（ADR-0003：删除时重新枚举并逐文件重校验）。
@@ -412,6 +423,7 @@ pub fn run() {
             scan_junk,
             clean_junk,
             take_clean_report,
+            get_junk_cache,
             ipc_hello
         ])
         .run(tauri::generate_context!())

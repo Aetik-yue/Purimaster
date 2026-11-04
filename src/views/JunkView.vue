@@ -18,9 +18,12 @@ let sessionCache: JunkScanResult | null = null;
 const scanning = ref(false);
 const cleaning = ref(false);
 const result = ref<JunkScanResult | null>(sessionCache);
+/** 当前展示的是后端缓存的历史结果（而非本次会话扫描） */
+const stale = ref(false);
 const error = ref("");
+/** 展开的规则详情 */
 const expanded = ref<Set<string>>(new Set());
-/** 已勾选的规则 id */
+/** 已勾选的规则 id（低风险默认勾选） */
 const selected = ref<Set<string>>(new Set());
 
 // 确认弹窗状态
@@ -77,6 +80,15 @@ const selectedBytes = computed(() =>
   selectedGroups.value.reduce((s, g) => s + g.bytes, 0)
 );
 
+/** 安全默认勾选：低风险自动勾上，中/高风险留给用户确认 */
+function initSelection(r: JunkScanResult) {
+  selected.value = new Set(
+    r.groups
+      .filter((g) => g.files > 0 && g.risk === "low")
+      .map((g) => g.ruleId)
+  );
+}
+
 function genId(): string {
   return typeof crypto.randomUUID === "function"
     ? crypto.randomUUID()
@@ -101,6 +113,8 @@ onMounted(async () => {
       if (payload.clientId !== clientId) return;
       result.value = payload.result;
       sessionCache = payload.result;
+      stale.value = false;
+      initSelection(payload.result);
       scanning.value = false;
     });
     await onEvent<{ clientId: string }>("junk://cancelled", (payload) => {
@@ -131,14 +145,30 @@ onMounted(async () => {
     // 报告恢复失败不影响主流程
   }
 
-  // 没有缓存结果才自动扫描；有缓存直接展示（用户可手动重新扫描）
-  if (!disposed && sessionCache === null) startScan();
+  // 结果来源优先级：会话缓存 → 后端缓存（标记为历史结果）→ 自动扫描
+  if (sessionCache !== null) {
+    result.value = sessionCache;
+    stale.value = false;
+    initSelection(sessionCache);
+  } else {
+    try {
+      const cached = await invoke<JunkScanResult | null>("get_junk_cache");
+      if (cached && !disposed) {
+        result.value = cached;
+        sessionCache = cached;
+        stale.value = true;
+        initSelection(cached);
+      }
+    } catch {
+      // 缓存读取失败则走自动扫描
+    }
+  }
+  if (!disposed && result.value === null) startScan();
 });
 
 onUnmounted(() => {
   disposed = true;
-  // 只取消扫描；已确认的清理**不**取消（用户已同意删除，中途停止只会留下部分删除），
-  // 报告由 take_clean_report 在下次进入页面时取回
+  // 只取消空间扫描类任务；垃圾扫描只读且会写入后端缓存，切页不打断
   if (clientId !== null) invoke("cancel_scan", { clientId }).catch(() => {});
   unlisteners.forEach((u) => u());
 });
@@ -148,6 +178,7 @@ async function startScan() {
   error.value = "";
   result.value = null;
   sessionCache = null;
+  stale.value = false;
   expanded.value = new Set();
   selected.value = new Set();
   const id = genId();
@@ -168,22 +199,13 @@ function cancelScan() {
   });
 }
 
-function toggleGroup(ruleId: string) {
-  const next = new Set(expanded.value);
-  if (next.has(ruleId)) {
-    next.delete(ruleId);
-  } else {
-    next.add(ruleId);
-  }
-  expanded.value = next;
-}
-
-function toggleSelect(ruleId: string) {
+function toggleSelect(group: JunkGroup) {
+  if (group.files === 0 || cleaning.value) return;
   const next = new Set(selected.value);
-  if (next.has(ruleId)) {
-    next.delete(ruleId);
+  if (next.has(group.ruleId)) {
+    next.delete(group.ruleId);
   } else {
-    next.add(ruleId);
+    next.add(group.ruleId);
   }
   selected.value = next;
 }
@@ -196,18 +218,14 @@ function toggleSelectAll() {
   }
 }
 
-/** 直接清理单个规则（行内按钮） */
-function cleanSingle(ruleId: string) {
-  if (cleaning.value || scanning.value) return;
-  selected.value = new Set([ruleId]);
-  openConfirm();
-}
-
-/** 一键清理全部（进入确认弹窗后仍可选择回收站/试运行） */
-function cleanAll() {
-  if (cleaning.value || scanning.value) return;
-  selected.value = new Set(selectableGroups.value.map((g) => g.ruleId));
-  openConfirm();
+function toggleExpand(ruleId: string) {
+  const next = new Set(expanded.value);
+  if (next.has(ruleId)) {
+    next.delete(ruleId);
+  } else {
+    next.add(ruleId);
+  }
+  expanded.value = next;
 }
 
 /** 打开确认弹窗：每次都重置为安全默认（回收站、非试运行） */
@@ -259,35 +277,40 @@ function groupTargetsSummary(group: JunkGroup): string {
     <div class="toolbar">
       <button v-if="scanning" class="danger" @click="cancelScan">取消扫描</button>
       <button v-else-if="cleaning" class="danger" @click="cancelCleaning">取消清理</button>
-      <button v-else class="primary" @click="startScan">重新扫描</button>
+      <button v-else class="ghost" @click="startScan">重新扫描</button>
       <span v-if="cleaning" class="status">正在清理…</span>
-      <span v-else-if="result && !scanning" class="hint">
-        勾选项目后点「清理选中」，或直接点某一行右侧的「清理」；不确定就先勾「仅试运行」看效果
-      </span>
     </div>
 
-    <p v-if="scanning" class="status">正在扫描垃圾文件…</p>
+    <p v-if="scanning" class="status big-status">正在扫描垃圾文件…</p>
     <p v-if="error" class="error">{{ error }}</p>
 
     <div v-if="result" class="result">
-      <div class="summary-bar">
-        <p class="summary">
-          共发现 <strong>{{ humanCount(result.totalFiles) }}</strong> 个可清理文件，合计
-          <strong>{{ humanSize(result.totalBytes) }}</strong>
-          <span v-if="result.skipped > 0"> · 跳过 {{ humanCount(result.skipped) }} 项</span>
-        </p>
+      <!-- 主视觉：可清理空间 + 立即清理 -->
+      <div class="hero">
+        <div class="hero-main">
+          <div class="hero-number">{{ humanSize(selectedBytes) }}</div>
+          <div class="hero-sub">
+            已选 {{ humanCount(selectedFiles) }} 个文件（共发现
+            {{ humanSize(result.totalBytes) }}）<template v-if="stale">
+              · 历史结果，可重新扫描</template
+            >
+          </div>
+        </div>
         <button
-          class="primary big"
-          :disabled="selectableGroups.length === 0 || cleaning || scanning"
-          @click="cleanAll"
+          class="primary clean-now"
+          :disabled="selectedFiles === 0 || cleaning || scanning"
+          :title="selectedFiles === 0 ? '请至少勾选一项' : ''"
+          @click="openConfirm"
         >
-          一键清理全部
+          立即清理
         </button>
       </div>
 
-      <p v-if="result.totalFiles === 0 && !scanning" class="empty">未发现可清理的垃圾文件 ✓</p>
+      <p v-if="result.totalFiles === 0 && !scanning" class="empty">
+        未发现可清理的垃圾文件 ✓
+      </p>
 
-      <div class="selection-bar">
+      <div class="list-hint">
         <label class="select-all">
           <input
             type="checkbox"
@@ -297,57 +320,45 @@ function groupTargetsSummary(group: JunkGroup): string {
           />
           全选
         </label>
-        <span class="selection-summary">
-          已选 {{ humanCount(selectedFiles) }} 个文件 · {{ humanSize(selectedBytes) }}
-        </span>
-        <button
-          class="primary"
-          :disabled="selectedFiles === 0 || cleaning || scanning"
-          :title="selectedFiles === 0 ? '请先勾选要清理的项目' : ''"
-          @click="openConfirm"
-        >
-          清理选中
-        </button>
+        <span class="hint-text">低风险项已自动勾选；点击行勾选/取消，点「详情」查看要删什么</span>
       </div>
 
       <div class="groups">
         <div v-for="cat in grouped" :key="cat.id" class="category">
-          <h2 class="category-title">
-            {{ cat.title }}
-            <span class="category-total">
-              {{ humanCount(cat.groups.reduce((s, g) => s + g.files, 0)) }} 文件 ·
-              {{ humanSize(cat.groups.reduce((s, g) => s + g.bytes, 0)) }}
-            </span>
-          </h2>
+          <h2 class="category-title">{{ cat.title }}</h2>
 
-          <div v-for="g in cat.groups" :key="g.ruleId" class="group">
-            <div class="group-row" @click="toggleGroup(g.ruleId)">
-              <span class="check" @click.stop>
-                <input
-                  v-if="g.files > 0"
-                  type="checkbox"
-                  :checked="selected.has(g.ruleId)"
-                  :disabled="cleaning"
-                  @change="toggleSelect(g.ruleId)"
-                />
-              </span>
-              <span class="caret" :class="{ open: expanded.has(g.ruleId) }">▸</span>
-              <span class="group-title">{{ g.title }}</span>
-              <span class="badge" :class="'risk-' + g.risk">{{ riskLabel[g.risk] }}</span>
-              <span class="group-meta">
-                {{ humanCount(g.files) }} 文件 · {{ humanSize(g.bytes) }}
-              </span>
-              <button
+          <div
+            v-for="g in cat.groups"
+            :key="g.ruleId"
+            class="group-row"
+            :class="{ selected: selected.has(g.ruleId), dimmed: g.files === 0 }"
+            @click="toggleSelect(g)"
+          >
+            <span class="check">
+              <input
                 v-if="g.files > 0"
-                class="mini-clean"
-                :disabled="cleaning || scanning"
-                title="只清理这一项"
-                @click.stop="cleanSingle(g.ruleId)"
-              >
-                清理
-              </button>
+                type="checkbox"
+                :checked="selected.has(g.ruleId)"
+                :disabled="cleaning"
+                @click.stop
+                @change="toggleSelect(g)"
+              />
+            </span>
+            <div class="group-main">
+              <div class="group-line">
+                <span class="group-title">{{ g.title }}</span>
+                <span class="badge" :class="'risk-' + g.risk">{{ riskLabel[g.risk] }}</span>
+                <span v-if="g.problems.length > 0" class="problem-dot" title="存在无法读取的目标">⚠</span>
+              </div>
+              <div class="group-sub">{{ humanCount(g.files) }} 个文件</div>
             </div>
+            <div class="group-size">{{ humanSize(g.bytes) }}</div>
+            <button class="ghost detail-btn" @click.stop="toggleExpand(g.ruleId)">
+              详情 {{ expanded.has(g.ruleId) ? "▴" : "▾" }}
+            </button>
+          </div>
 
+          <div v-for="g in cat.groups" :key="g.ruleId + '-detail'">
             <div v-if="expanded.has(g.ruleId)" class="group-detail">
               <div class="detail-line"><span class="detail-label">目标</span>{{ groupTargetsSummary(g) }}</div>
               <div v-for="p in g.problems" :key="p" class="detail-line problem">⚠ {{ p }}</div>
@@ -360,6 +371,7 @@ function groupTargetsSummary(group: JunkGroup): string {
                   仅预览最大的 {{ g.topFiles.length }} 个文件，共 {{ humanCount(g.files) }} 个
                 </p>
               </div>
+              <div v-else-if="g.files === 0" class="detail-line muted">（无可清理文件，仅存在异常目标）</div>
             </div>
           </div>
         </div>
@@ -370,9 +382,18 @@ function groupTargetsSummary(group: JunkGroup): string {
     <div v-if="showConfirm" class="overlay">
       <div class="modal">
         <h3>确认清理</h3>
+        <div class="confirm-list">
+          <div v-for="g in selectedGroups" :key="g.ruleId" class="confirm-row">
+            <span>{{ g.title }}</span>
+            <span class="confirm-size">{{ humanSize(g.bytes) }}</span>
+          </div>
+          <div v-if="selectedGroups.length > 6" class="detail-line muted">
+            …等 {{ selectedGroups.length }} 个项目
+          </div>
+        </div>
         <p class="modal-line">
-          将清理 <strong>{{ humanCount(selectedFiles) }}</strong> 个文件，共
-          <strong>{{ humanSize(selectedBytes) }}</strong>。
+          共 <strong>{{ humanCount(selectedFiles) }}</strong> 个文件 ·
+          <strong>{{ humanSize(selectedBytes) }}</strong>
         </p>
         <label class="option">
           <input v-model="mode" type="radio" value="trash" />
@@ -450,15 +471,21 @@ function groupTargetsSummary(group: JunkGroup): string {
   display: flex;
   align-items: center;
   gap: 12px;
+  flex-shrink: 0;
+}
+
+.ghost {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
 }
 
 .status {
   color: var(--accent);
 }
 
-.hint {
-  font-size: 12px;
-  color: var(--text-secondary);
+.big-status {
+  font-size: 15px;
 }
 
 .error {
@@ -470,42 +497,59 @@ function groupTargetsSummary(group: JunkGroup): string {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
 }
 
-.summary-bar {
+/* 主视觉区 */
+.hero {
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 24px;
+  padding: 18px 24px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
 }
 
-.summary {
-  color: var(--text-secondary);
-  font-variant-numeric: tabular-nums;
+.hero-main {
   margin-right: auto;
 }
 
-.summary strong {
+.hero-number {
+  font-size: 34px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
   color: var(--text);
+  line-height: 1.15;
 }
 
-button.big {
-  padding: 9px 22px;
-  font-size: 14px;
+.hero-sub {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.clean-now {
+  font-size: 16px;
+  padding: 12px 34px;
+  border-radius: 10px;
+}
+
+.clean-now:disabled {
+  opacity: 0.45;
 }
 
 .empty {
   color: #1a9e55;
+  font-size: 15px;
+  padding: 24px;
+  text-align: center;
 }
 
-.selection-bar {
+.list-hint {
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 8px 12px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  gap: 12px;
+  flex-shrink: 0;
 }
 
 .select-all {
@@ -514,15 +558,12 @@ button.big {
   gap: 6px;
   cursor: pointer;
   user-select: none;
+  font-size: 13px;
 }
 
-.selection-summary {
+.hint-text {
+  font-size: 12px;
   color: var(--text-secondary);
-  font-variant-numeric: tabular-nums;
-}
-
-.selection-bar button {
-  margin-left: auto;
 }
 
 .groups {
@@ -532,41 +573,41 @@ button.big {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 12px 16px;
+  padding: 10px 14px;
 }
 
 .category {
-  margin-bottom: 18px;
+  margin-bottom: 14px;
 }
 
 .category-title {
-  font-size: 14px;
-  margin-bottom: 6px;
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-}
-
-.category-total {
-  font-size: 12px;
-  font-weight: 400;
+  font-size: 13px;
   color: var(--text-secondary);
-  font-variant-numeric: tabular-nums;
+  margin: 8px 0 4px;
 }
 
 .group-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  height: 36px;
-  padding: 0 8px;
-  border-radius: 6px;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
   cursor: pointer;
   user-select: none;
+  border: 1px solid transparent;
 }
 
 .group-row:hover {
   background: rgba(47, 111, 237, 0.06);
+}
+
+.group-row.selected {
+  background: rgba(47, 111, 237, 0.08);
+  border-color: rgba(47, 111, 237, 0.25);
+}
+
+.group-row.dimmed {
+  opacity: 0.55;
 }
 
 .check {
@@ -574,15 +615,14 @@ button.big {
   align-items: center;
 }
 
-.caret {
-  width: 14px;
-  text-align: center;
-  color: var(--text-secondary);
-  transition: transform 0.12s;
+.group-main {
+  min-width: 0;
 }
 
-.caret.open {
-  transform: rotate(90deg);
+.group-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .group-title {
@@ -610,28 +650,38 @@ button.big {
   background: #fee2e2;
 }
 
-.group-meta {
-  margin-left: auto;
+.problem-dot {
+  color: #b45309;
+  font-size: 12px;
+}
+
+.group-sub {
   font-size: 12px;
   color: var(--text-secondary);
+}
+
+.group-size {
+  margin-left: auto;
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
-}
-
-.mini-clean {
   flex-shrink: 0;
-  padding: 3px 12px;
-  font-size: 12px;
-  background: var(--accent);
-  color: #fff;
-  border-radius: 5px;
 }
 
-.mini-clean:hover {
-  background: var(--accent-hover);
+.detail-btn {
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 12px;
+  padding: 4px 8px;
+}
+
+.detail-btn:hover {
+  color: var(--accent);
 }
 
 .group-detail {
-  padding: 4px 8px 8px 30px;
+  padding: 6px 12px 10px 40px;
 }
 
 .detail-line {
@@ -692,7 +742,7 @@ button.big {
 }
 
 .modal {
-  width: 440px;
+  width: 460px;
   max-width: calc(100vw - 48px);
   background: var(--surface);
   border-radius: 10px;
@@ -716,6 +766,26 @@ button.big {
   font-weight: 400;
   color: #b45309;
   margin-left: 6px;
+}
+
+.confirm-list {
+  max-height: 180px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+
+.confirm-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 3px 0;
+  font-size: 13px;
+}
+
+.confirm-size {
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
 }
 
 .modal-line {
