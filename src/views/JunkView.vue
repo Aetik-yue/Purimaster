@@ -1,15 +1,19 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import ReportModal from "../components/ReportModal.vue";
 import { humanCount, humanSize } from "../lib/format";
 import type {
   CleanCompletePayload,
+  CleanProgressPayload,
   CleanReport,
   JunkCompletePayload,
   JunkGroup,
+  JunkScanProgressPayload,
   JunkScanResult,
   Risk,
+  TargetedCompletePayload,
 } from "../types";
 
 // 会话级缓存：切页回来直接显示上次结果，不重复扫描（清理时后端会重新枚举，显示值略旧是安全的）
@@ -18,6 +22,24 @@ let sessionCache: JunkScanResult | null = null;
 const scanning = ref(false);
 const cleaning = ref(false);
 const result = ref<JunkScanResult | null>(sessionCache);
+/** 垃圾扫描进度（规则推进）；null 表示尚未收到进度 */
+const junkProgress = ref<JunkScanProgressPayload | null>(null);
+/** 清理进度（已完成计数）；null 表示尚未收到进度 */
+const cleanProgress = ref<CleanProgressPayload | null>(null);
+/** 本次清理是否为预演（清理中报告尚不存在，用发起时的选择判断"已/将释放"文案） */
+const cleaningDryRun = ref(false);
+/** 用户主动取消后的提示（区别于错误，非红色） */
+const cancelNotice = ref("");
+
+// 定向清理：用户指定目录，走与规则清理完全相同的安全管线
+const showTargeted = ref(false);
+const targetedPath = ref("");
+const targetedInclude = ref("");
+const targetedSkipRecent = ref(true);
+const targetedScanning = ref(false);
+const targetedResult = ref<JunkScanResult | null>(null);
+const targetedError = ref("");
+let targetedClientId: string | null = null;
 /** 当前展示的是后端缓存的历史结果（而非本次会话扫描） */
 const stale = ref(false);
 const error = ref("");
@@ -30,6 +52,42 @@ const selected = ref<Set<string>>(new Set());
 const showConfirm = ref(false);
 const mode = ref<"trash" | "permanent">("trash");
 const dryRun = ref(false);
+/** 永久删除的确认词（需求：永久删除需二次确认，键入"删除"解锁按钮） */
+const confirmWord = ref("");
+const confirmWordInput = ref<HTMLInputElement | null>(null);
+
+/** 扫描进度条百分比（按规则推进；未收到进度时为 0） */
+const scanPercent = computed(() => {
+  const p = junkProgress.value;
+  if (!p || p.ruleCount === 0) return 0;
+  return Math.round(((p.ruleIndex + 1) / p.ruleCount) * 100);
+});
+
+// 弹窗打开时聚焦确认词输入框
+watch(showConfirm, (open) => {
+  if (open) {
+    void nextTick(() => confirmWordInput.value?.focus());
+  }
+});
+
+/** Esc 关闭弹窗：确认 → 定向清理 → 报告（关窗保护弹窗不响应 Esc——安全确认不跳过） */
+function onGlobalKeydown(e: KeyboardEvent) {
+  if (e.key !== "Escape") return;
+  if (showConfirm.value) {
+    showConfirm.value = false;
+    return;
+  }
+  if (showTargeted.value) {
+    showTargeted.value = false;
+    return;
+  }
+  if (showReport.value && report.value) {
+    closeReport();
+  }
+}
+
+/** 确认弹窗列表里是否有定向清理（其说明/警示与规则清理一致） */
+const targetedGroup = computed(() => targetedResult.value?.groups[0] ?? null);
 
 // 清理报告
 const report = ref<CleanReport | null>(null);
@@ -63,7 +121,7 @@ const grouped = computed(() => {
 });
 
 const selectableGroups = computed(
-  () => result.value?.groups.filter((g) => g.files > 0) ?? []
+  () => result.value?.groups.filter((g) => g.files > 0 && !g.scanOnly) ?? []
 );
 const allSelected = computed(
   () =>
@@ -79,12 +137,23 @@ const selectedFiles = computed(() =>
 const selectedBytes = computed(() =>
   selectedGroups.value.reduce((s, g) => s + g.bytes, 0)
 );
+/** 选中项里是否存在中/高风险（确认弹窗需要更强警示，F-10） */
+const hasRiskSelection = computed(() =>
+  selectedGroups.value.some((g) => g.risk !== "low")
+);
+/** 永久删除（非预演）必须键入确认词"删除"才允许开始（需求：二次确认，F-05） */
+const needsConfirmWord = computed(
+  () => mode.value === "permanent" && !dryRun.value
+);
+const canStartClean = computed(
+  () => !needsConfirmWord.value || confirmWord.value.trim() === "删除"
+);
 
-/** 安全默认勾选：低风险自动勾上，中/高风险留给用户确认 */
+/** 安全默认勾选：低风险自动勾上，中/高风险留给用户确认；仅扫描规则不可勾选 */
 function initSelection(r: JunkScanResult) {
   selected.value = new Set(
     r.groups
-      .filter((g) => g.files > 0 && g.risk === "low")
+      .filter((g) => g.files > 0 && g.risk === "low" && !g.scanOnly)
       .map((g) => g.ruleId)
   );
 }
@@ -108,7 +177,12 @@ async function onEvent<T>(event: string, handler: (payload: T) => void) {
 }
 
 onMounted(async () => {
+  window.addEventListener("keydown", onGlobalKeydown);
   try {
+    await onEvent<JunkScanProgressPayload>("junk://progress", (payload) => {
+      if (payload.clientId !== clientId) return;
+      junkProgress.value = payload;
+    });
     await onEvent<JunkCompletePayload>("junk://complete", (payload) => {
       if (payload.clientId !== clientId) return;
       result.value = payload.result;
@@ -116,16 +190,33 @@ onMounted(async () => {
       stale.value = false;
       initSelection(payload.result);
       scanning.value = false;
+      junkProgress.value = null;
     });
     await onEvent<{ clientId: string }>("junk://cancelled", (payload) => {
       if (payload.clientId !== clientId) return;
       scanning.value = false;
+      junkProgress.value = null;
+      cancelNotice.value = "扫描已取消";
+    });
+    await onEvent<TargetedCompletePayload>("targeted://complete", (payload) => {
+      if (payload.clientId !== targetedClientId) return;
+      targetedResult.value = payload.result;
+      targetedScanning.value = false;
+    });
+    await onEvent<{ clientId: string }>("targeted://cancelled", (payload) => {
+      if (payload.clientId !== targetedClientId) return;
+      targetedScanning.value = false;
+    });
+    await onEvent<CleanProgressPayload>("clean://progress", (payload) => {
+      if (payload.clientId !== cleanClientId) return;
+      cleanProgress.value = payload;
     });
     await onEvent<CleanCompletePayload>("clean://complete", (payload) => {
       if (payload.clientId !== cleanClientId) return;
       report.value = payload.report;
       showReport.value = true;
       cleaning.value = false;
+      cleanProgress.value = null;
       selected.value = new Set();
     });
   } catch (err) {
@@ -168,7 +259,9 @@ onMounted(async () => {
 
 onUnmounted(() => {
   disposed = true;
-  // 只取消空间扫描类任务；垃圾扫描只读且会写入后端缓存，切页不打断
+  window.removeEventListener("keydown", onGlobalKeydown);
+  // KeepAlive 下切页签不会触发本钩子（垃圾扫描只读且写入后端缓存，本就切页不打断）；
+  // 应用整体退出时取消仍未完成的扫描
   if (clientId !== null) invoke("cancel_scan", { clientId }).catch(() => {});
   unlisteners.forEach((u) => u());
 });
@@ -176,8 +269,10 @@ onUnmounted(() => {
 async function startScan() {
   if (cleaning.value) return;
   error.value = "";
+  cancelNotice.value = "";
   result.value = null;
   sessionCache = null;
+  junkProgress.value = null;
   stale.value = false;
   expanded.value = new Set();
   selected.value = new Set();
@@ -200,7 +295,7 @@ function cancelScan() {
 }
 
 function toggleSelect(group: JunkGroup) {
-  if (group.files === 0 || cleaning.value) return;
+  if (group.files === 0 || group.scanOnly || cleaning.value) return;
   const next = new Set(selected.value);
   if (next.has(group.ruleId)) {
     next.delete(group.ruleId);
@@ -228,10 +323,11 @@ function toggleExpand(ruleId: string) {
   expanded.value = next;
 }
 
-/** 打开确认弹窗：每次都重置为安全默认（回收站、非试运行） */
+/** 打开确认弹窗：每次都重置为安全默认（回收站、非试运行、空确认词） */
 function openConfirm() {
   mode.value = "trash";
   dryRun.value = false;
+  confirmWord.value = "";
   showConfirm.value = true;
 }
 
@@ -240,6 +336,8 @@ async function confirmClean() {
   showConfirm.value = false;
   error.value = "";
   report.value = null;
+  cleanProgress.value = null;
+  cleaningDryRun.value = dryRun.value;
   const id = genId();
   cleanClientId = id;
   cleaning.value = true;
@@ -258,7 +356,88 @@ async function confirmClean() {
 
 function cancelCleaning() {
   if (cleanClientId === null) return;
-  invoke("cancel_scan", { clientId: cleanClientId }).catch(() => {});
+  invoke("cancel_scan", { clientId: cleanClientId }).catch((err) => {
+    // 取消失败必须可见（对比此前静默吞掉，F-38）
+    error.value = `取消失败：${err}`;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 定向清理
+// ---------------------------------------------------------------------------
+
+function openTargeted() {
+  // 安全默认（与确认弹窗一致）
+  mode.value = "trash";
+  dryRun.value = false;
+  confirmWord.value = "";
+  targetedError.value = "";
+  showTargeted.value = true;
+}
+
+/** 类型过滤输入 → include glob 列表（中英文逗号均可） */
+function parseInclude(): string[] {
+  return targetedInclude.value
+    .split(/[,，]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+async function startTargetedScan() {
+  const p = targetedPath.value.trim();
+  if (!p) {
+    targetedError.value = "请输入要清理的目录路径";
+    return;
+  }
+  targetedError.value = "";
+  targetedResult.value = null;
+  const id = genId();
+  targetedClientId = id;
+  targetedScanning.value = true;
+  try {
+    await invoke("scan_targeted", {
+      clientId: id,
+      path: p,
+      include: parseInclude(),
+      skipRecent: targetedSkipRecent.value,
+    });
+  } catch (err) {
+    targetedError.value = String(err);
+    targetedScanning.value = false;
+  }
+}
+
+function cancelTargetedScan() {
+  if (targetedClientId === null) return;
+  invoke("cancel_scan", { clientId: targetedClientId }).catch(() => {});
+}
+
+async function confirmTargetedClean() {
+  const group = targetedGroup.value;
+  if (!group || group.files === 0 || cleaning.value || !canStartClean.value) return;
+  showTargeted.value = false;
+  error.value = "";
+  report.value = null;
+  cleanProgress.value = null;
+  cleaningDryRun.value = dryRun.value;
+  const id = genId();
+  cleanClientId = id;
+  cleaning.value = true;
+  try {
+    await invoke("clean_targeted", {
+      clientId: id,
+      request: {
+        path: targetedPath.value.trim(),
+        include: parseInclude(),
+        skipRecent: targetedSkipRecent.value,
+        permanent: mode.value === "permanent",
+        dryRun: dryRun.value,
+      },
+    });
+  } catch (err) {
+    error.value = String(err);
+    cleaning.value = false;
+  }
 }
 
 function closeReport() {
@@ -278,16 +457,41 @@ function groupTargetsSummary(group: JunkGroup): string {
       <button v-if="scanning" class="danger" @click="cancelScan">取消扫描</button>
       <button v-else-if="cleaning" class="danger" @click="cancelCleaning">取消清理</button>
       <button v-else class="ghost" @click="startScan">重新扫描</button>
-      <span v-if="cleaning" class="status">正在清理…</span>
+      <span v-if="cleaning" class="status">
+        <template v-if="cleanProgress">
+          正在清理「{{ cleanProgress.currentTitle }}」… 已处理
+          {{ humanCount(cleanProgress.deletedFiles + cleanProgress.failedCount) }} 个文件<template
+            v-if="cleanProgress.deletedFiles > 0"
+          >
+            · 已{{ cleaningDryRun ? "将" : "" }}释放 {{ humanSize(cleanProgress.freedBytes) }}</template
+          >
+        </template>
+        <template v-else>正在清理…</template>
+      </span>
     </div>
 
-    <p v-if="scanning" class="status big-status">正在扫描垃圾文件…</p>
+    <p v-if="cancelNotice && !scanning" class="status">{{ cancelNotice }}</p>
+    <p v-if="scanning" class="status big-status">
+      <template v-if="junkProgress">
+        正在扫描垃圾文件…「{{ junkProgress.currentTitle }}」（{{ junkProgress.ruleIndex + 1 }}/{{
+          junkProgress.ruleCount
+        }}）· 已发现 {{ humanCount(junkProgress.files) }} 个文件（{{
+          humanSize(junkProgress.bytes)
+        }}）
+      </template>
+      <template v-else>正在扫描垃圾文件…</template>
+    </p>
+    <!-- 细进度条：随规则推进（无总量百分比，规则数是唯一确定刻度） -->
+    <div v-if="scanning" class="scan-bar">
+      <div class="scan-bar-fill" :style="{ width: scanPercent + '%' }"></div>
+    </div>
     <p v-if="error" class="error">{{ error }}</p>
 
     <div v-if="result" class="result">
       <!-- 主视觉：可清理空间 + 立即清理 -->
       <div class="hero">
         <div class="hero-main">
+          <div class="hero-label">已勾选可清理</div>
           <div class="hero-number">{{ humanSize(selectedBytes) }}</div>
           <div class="hero-sub">
             已选 {{ humanCount(selectedFiles) }} 个文件（共发现
@@ -303,6 +507,14 @@ function groupTargetsSummary(group: JunkGroup): string {
           @click="openConfirm"
         >
           立即清理
+        </button>
+        <button
+          class="ghost targeted-btn"
+          :disabled="cleaning || scanning"
+          title="指定任意目录进行清理，与规则清理走同一套安全检查"
+          @click="openTargeted"
+        >
+          定向清理
         </button>
       </div>
 
@@ -320,7 +532,9 @@ function groupTargetsSummary(group: JunkGroup): string {
           />
           全选
         </label>
-        <span class="hint-text">低风险项已自动勾选；点击行勾选/取消，点「详情」查看要删什么</span>
+        <span class="hint-text"
+          >低风险项已自动勾选；全选会包含中/高风险项，清理前请逐项确认。可先在确认弹窗勾选「先预演」查看将清理的内容</span
+        >
       </div>
 
       <div class="groups">
@@ -331,12 +545,12 @@ function groupTargetsSummary(group: JunkGroup): string {
             v-for="g in cat.groups"
             :key="g.ruleId"
             class="group-row"
-            :class="{ selected: selected.has(g.ruleId), dimmed: g.files === 0 }"
+            :class="{ selected: selected.has(g.ruleId), dimmed: g.files === 0 || g.scanOnly }"
             @click="toggleSelect(g)"
           >
             <span class="check">
               <input
-                v-if="g.files > 0"
+                v-if="g.files > 0 && !g.scanOnly"
                 type="checkbox"
                 :checked="selected.has(g.ruleId)"
                 :disabled="cleaning"
@@ -347,10 +561,17 @@ function groupTargetsSummary(group: JunkGroup): string {
             <div class="group-main">
               <div class="group-line">
                 <span class="group-title">{{ g.title }}</span>
+                <span v-if="g.scanOnly" class="badge scan-only" title="该规则配置为仅扫描，不参与清理">仅扫描</span>
                 <span class="badge" :class="'risk-' + g.risk">{{ riskLabel[g.risk] }}</span>
                 <span v-if="g.problems.length > 0" class="problem-dot" title="存在无法读取的目标">⚠</span>
               </div>
-              <div class="group-sub">{{ humanCount(g.files) }} 个文件</div>
+              <div class="group-sub">
+                {{ humanCount(g.files) }} 个文件<template v-if="g.scanOnly">
+                  · 不参与清理（规则声明目标有条件限制）</template
+                ><template v-if="g.freshFiles > 0">
+                  · 另有 {{ humanCount(g.freshFiles) }} 个近期文件未计入（可能正在使用）</template
+                >
+              </div>
             </div>
             <div class="group-size">{{ humanSize(g.bytes) }}</div>
             <button class="ghost detail-btn" @click.stop="toggleExpand(g.ruleId)">
@@ -360,6 +581,7 @@ function groupTargetsSummary(group: JunkGroup): string {
 
           <div v-for="g in cat.groups" :key="g.ruleId + '-detail'">
             <div v-if="expanded.has(g.ruleId)" class="group-detail">
+              <div v-if="g.description" class="detail-line desc">{{ g.description }}</div>
               <div class="detail-line"><span class="detail-label">目标</span>{{ groupTargetsSummary(g) }}</div>
               <div v-for="p in g.problems" :key="p" class="detail-line problem">⚠ {{ p }}</div>
               <div v-if="g.topFiles.length > 0" class="files">
@@ -378,14 +600,137 @@ function groupTargetsSummary(group: JunkGroup): string {
       </div>
     </div>
 
-    <!-- 确认弹窗 -->
-    <div v-if="showConfirm" class="overlay">
+    <!-- 定向清理弹窗 -->
+    <div v-if="showTargeted" class="overlay" @click.self="showTargeted = false">
+      <div class="modal wide">
+        <h3>定向清理</h3>
+        <p class="detail-line desc">
+          清理你指定的目录。与规则清理走同一套安全检查：系统路径保护（系统/个人目录会被拒绝）、
+          逐文件校验、默认移入回收站。
+        </p>
+        <label class="field">
+          <span class="field-label">目录路径</span>
+          <input
+            v-model="targetedPath"
+            type="text"
+            placeholder="如 D:\Downloads\old-logs"
+            :disabled="targetedScanning"
+            @keydown.enter="!targetedScanning && !targetedResult && startTargetedScan()"
+          />
+        </label>
+        <label class="field">
+          <span class="field-label">文件类型过滤（可选，逗号分隔，如 *.log, *.tmp）</span>
+          <input
+            v-model="targetedInclude"
+            type="text"
+            placeholder="留空 = 全部文件"
+            :disabled="targetedScanning"
+          />
+        </label>
+        <label class="option">
+          <input v-model="targetedSkipRecent" type="checkbox" :disabled="targetedScanning" />
+          跳过最近 24 小时内修改的文件（推荐——正在使用的文件几乎都是新写的）
+        </label>
+
+        <div v-if="targetedScanning" class="status">
+          正在扫描（大目录可能需要一些时间）…
+          <button class="ghost scan-cancel" @click="cancelTargetedScan">取消</button>
+        </div>
+        <p v-if="targetedError" class="error">{{ targetedError }}</p>
+
+        <template v-if="targetedGroup && !targetedScanning">
+          <div class="targeted-summary">
+            共 <strong>{{ humanCount(targetedGroup.files) }}</strong> 个文件 ·
+            <strong>{{ humanSize(targetedGroup.bytes) }}</strong>
+            <template v-if="targetedGroup.freshFiles > 0">
+              · 另有 {{ humanCount(targetedGroup.freshFiles) }} 个近期文件未计入</template
+            >
+          </div>
+          <div v-if="targetedGroup.problems.length > 0" class="targeted-problems">
+            <div v-for="p in targetedGroup.problems" :key="p" class="detail-line problem">
+              ⚠ {{ p }}
+            </div>
+          </div>
+          <div v-if="targetedGroup.topFiles.length > 0" class="targeted-files">
+            <div
+              v-for="f in targetedGroup.topFiles.slice(0, 20)"
+              :key="f.path"
+              class="file-row"
+              :title="f.path"
+            >
+              <span class="file-path">{{ f.path }}</span>
+              <span class="file-size">{{ humanSize(f.size) }}</span>
+            </div>
+            <p v-if="targetedGroup.files > targetedGroup.topFiles.length" class="detail-line muted">
+              仅预览最大的 20 个文件，共 {{ humanCount(targetedGroup.files) }} 个
+            </p>
+          </div>
+          <template v-if="targetedGroup.files > 0">
+            <label class="option">
+              <input v-model="mode" type="radio" value="trash" />
+              移入回收站（推荐，可恢复）
+            </label>
+            <label class="option">
+              <input v-model="mode" type="radio" value="permanent" />
+              永久删除（不可恢复）
+            </label>
+            <label class="option">
+              <input v-model="dryRun" type="checkbox" />
+              先预演（只检查，不删除任何文件）
+            </label>
+            <template v-if="mode === 'permanent' && !dryRun">
+              <p class="warn">⚠ 永久删除将绕过回收站直接删除，无法恢复。请输入「删除」确认。</p>
+              <input
+                ref="confirmWordInput"
+                v-model="confirmWord"
+                class="confirm-word"
+                type="text"
+                placeholder="输入：删除"
+                @keydown.enter="canStartClean && confirmTargetedClean()"
+              />
+            </template>
+          </template>
+          <p v-else class="detail-line muted">
+            该目录下没有匹配的文件（或都被年龄策略跳过）。
+          </p>
+        </template>
+
+        <div class="modal-actions">
+          <button @click="showTargeted = false">关闭</button>
+          <button
+            v-if="!targetedResult || targetedScanning"
+            class="primary"
+            :disabled="targetedScanning || !targetedPath.trim()"
+            @click="startTargetedScan"
+          >
+            扫描该目录
+          </button>
+          <button
+            v-else-if="targetedGroup && targetedGroup.files > 0"
+            class="primary"
+            :disabled="cleaning || !canStartClean"
+            @click="confirmTargetedClean"
+          >
+            开始清理
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 确认弹窗（Esc / 点击遮罩关闭 = 取消，不做任何删除） -->
+    <div v-if="showConfirm" class="overlay" @click.self="showConfirm = false">
       <div class="modal">
         <h3>确认清理</h3>
         <div class="confirm-list">
-          <div v-for="g in selectedGroups" :key="g.ruleId" class="confirm-row">
-            <span>{{ g.title }}</span>
-            <span class="confirm-size">{{ humanSize(g.bytes) }}</span>
+          <div v-for="g in selectedGroups" :key="g.ruleId" class="confirm-item">
+            <div class="confirm-row">
+              <span class="confirm-title">
+                {{ g.title }}
+                <span class="badge" :class="'risk-' + g.risk">{{ riskLabel[g.risk] }}</span>
+              </span>
+              <span class="confirm-size">{{ humanSize(g.bytes) }}</span>
+            </div>
+            <div v-if="g.description" class="confirm-desc">{{ g.description }}</div>
           </div>
           <div v-if="selectedGroups.length > 6" class="detail-line muted">
             …等 {{ selectedGroups.length }} 个项目
@@ -394,6 +739,9 @@ function groupTargetsSummary(group: JunkGroup): string {
         <p class="modal-line">
           共 <strong>{{ humanCount(selectedFiles) }}</strong> 个文件 ·
           <strong>{{ humanSize(selectedBytes) }}</strong>
+        </p>
+        <p v-if="hasRiskSelection" class="warn">
+          ⚠ 所选内容包含中/高风险项目，请确认「详情」里的目标与文件确实可以丢弃。
         </p>
         <label class="option">
           <input v-model="mode" type="radio" value="trash" />
@@ -405,56 +753,38 @@ function groupTargetsSummary(group: JunkGroup): string {
         </label>
         <label class="option">
           <input v-model="dryRun" type="checkbox" />
-          仅试运行（执行全部安全检查但不删除）
+          先预演（只检查，不删除任何文件）
         </label>
-        <p v-if="mode === 'permanent' && !dryRun" class="warn">
-          ⚠ 永久删除的文件无法从回收站恢复。请确认这些内容确实可以丢弃。
+        <p class="detail-line muted option-explain">
+          回收站：文件可随时还原，磁盘空间在清空回收站后才真正释放。永久删除：绕过回收站，
+          事后无法恢复。预演：列出将要处理的文件，不动任何东西。个别文件若正被占用会删除失败
+          并在报告中列出，不影响其余文件。
         </p>
+        <template v-if="mode === 'permanent' && !dryRun">
+          <p class="warn">
+            ⚠ 永久删除将绕过回收站直接删除文件，事后无法通过任何方式恢复。
+            请输入「删除」以确认执行。
+          </p>
+          <input
+            ref="confirmWordInput"
+            v-model="confirmWord"
+            class="confirm-word"
+            type="text"
+            placeholder="输入：删除"
+            @keydown.enter="canStartClean && confirmClean()"
+          />
+        </template>
         <div class="modal-actions">
           <button @click="showConfirm = false">取消</button>
-          <button class="primary" @click="confirmClean">开始清理</button>
+          <button class="primary" :disabled="!canStartClean" @click="confirmClean">
+            开始清理
+          </button>
         </div>
       </div>
     </div>
 
-    <!-- 清理报告 -->
-    <div v-if="showReport && report" class="overlay">
-      <div class="modal wide">
-        <h3>
-          {{ report.dryRun ? "试运行完成" : "清理完成" }}
-          <span v-if="report.cancelled" class="cancel-tag">（已取消，以下为已完成部分）</span>
-        </h3>
-        <p class="modal-line">
-          {{ report.dryRun ? "将" : "已" }}{{ report.mode === "trash" ? "移入回收站" : "永久删除" }}
-          <strong>{{ humanCount(report.deletedFiles) }}</strong> 个文件<template
-            v-if="report.mode === 'trash'"
-            >，清空回收站后释放 <strong>{{ humanSize(report.freedBytes) }}</strong></template
-          ><template v-else
-            >，{{ report.dryRun ? "可释放" : "释放" }}
-            <strong>{{ humanSize(report.freedBytes) }}</strong></template
-          >。
-        </p>
-        <p v-if="report.skipped > 0" class="detail-line muted">
-          另有 {{ humanCount(report.skipped) }} 个条目因读取失败或目标异常被跳过。
-        </p>
-        <p v-if="report.failedCount > 0" class="warn">
-          失败 {{ humanCount(report.failedCount) }} 个文件（如被占用、只读或权限不足）：
-        </p>
-        <div v-if="report.failed.length" class="failures">
-          <div v-for="f in report.failed" :key="f.path" class="fail-row">
-            <span class="fail-path" :title="f.path">{{ f.path }}</span>
-            <span class="fail-err">{{ f.error }}</span>
-          </div>
-        </div>
-        <details v-if="report.skippedRules.length" class="skipped">
-          <summary>跳过的规则/目标（{{ report.skippedRules.length }}）</summary>
-          <div v-for="s in report.skippedRules" :key="s" class="detail-line">{{ s }}</div>
-        </details>
-        <div class="modal-actions">
-          <button class="primary" @click="closeReport">好的</button>
-        </div>
-      </div>
-    </div>
+    <!-- 清理报告（共享组件；关闭 = 隐藏并自动重扫） -->
+    <ReportModal v-if="showReport && report" :report="report" @close="closeReport" />
   </section>
 </template>
 
@@ -492,6 +822,22 @@ function groupTargetsSummary(group: JunkGroup): string {
   color: var(--danger);
 }
 
+/* 扫描进度条 */
+.scan-bar {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.scan-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.25s ease;
+}
+
 .result {
   flex: 1;
   min-height: 0;
@@ -513,6 +859,11 @@ function groupTargetsSummary(group: JunkGroup): string {
 
 .hero-main {
   margin-right: auto;
+}
+
+.hero-label {
+  font-size: 12px;
+  color: var(--text-secondary);
 }
 
 .hero-number {
@@ -650,6 +1001,11 @@ function groupTargetsSummary(group: JunkGroup): string {
   background: #fee2e2;
 }
 
+.badge.scan-only {
+  color: #475569;
+  background: #e2e8f0;
+}
+
 .problem-dot {
   color: #b45309;
   font-size: 12px;
@@ -702,6 +1058,10 @@ function groupTargetsSummary(group: JunkGroup): string {
 .detail-label {
   display: inline-block;
   margin-right: 8px;
+  color: var(--text);
+}
+
+.detail-line.desc {
   color: var(--text);
 }
 
@@ -781,6 +1141,76 @@ function groupTargetsSummary(group: JunkGroup): string {
   justify-content: space-between;
   padding: 3px 0;
   font-size: 13px;
+}
+
+.confirm-item {
+  padding: 3px 0;
+}
+
+.confirm-desc {
+  font-size: 12px;
+  color: var(--text-secondary);
+  padding: 1px 0 3px;
+}
+
+.option-explain {
+  padding: 2px 0 4px;
+  line-height: 1.6;
+}
+
+.targeted-btn {
+  font-size: 16px;
+  padding: 12px 22px;
+  border-radius: 10px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.field-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.targeted-summary {
+  font-size: 14px;
+}
+
+.targeted-problems {
+  max-height: 96px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+
+.targeted-files {
+  max-height: 200px;
+  overflow-y: auto;
+  border-top: 1px dashed var(--border);
+  padding-top: 6px;
+}
+
+.scan-cancel {
+  margin-left: 10px;
+  padding: 2px 12px;
+  font-size: 12px;
+}
+
+.confirm-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.confirm-word {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 14px;
 }
 
 .confirm-size {

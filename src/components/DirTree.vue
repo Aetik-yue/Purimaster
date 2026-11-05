@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, inject, onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import type { FileListing, NodeSummary } from "../types";
+import type { FileEntry, FileListing, NodeSummary } from "../types";
 import { humanCount, humanSize } from "../lib/format";
+import { FileSelectionKey, type FileSelection } from "../lib/selection";
 
 /** 单个目录最多渲染多少行子目录（更多折叠为提示） */
 const MAX_CHILD_ROWS = 100;
@@ -27,12 +28,14 @@ const expanded = ref(depth.value < 1);
 const children = ref<NodeSummary[] | null>(props.initialChildren ?? null);
 const loadingChildren = ref(false);
 const childrenError = ref("");
+/** 当前展示的子目录条数上限（"显示更多"分段放开，后端返回的是全量） */
+const childLimit = ref(MAX_CHILD_ROWS);
 
 const files = ref<FileListing | null>(null);
 const loadingFiles = ref(false);
 const filesError = ref("");
 
-const visibleChildren = computed(() => children.value?.slice(0, MAX_CHILD_ROWS) ?? []);
+const visibleChildren = computed(() => children.value?.slice(0, childLimit.value) ?? []);
 const omittedChildren = computed(
   () => (children.value?.length ?? 0) - visibleChildren.value.length
 );
@@ -40,11 +43,25 @@ const omittedFiles = computed(
   () => (files.value ? files.value.total - files.value.files.length : 0)
 );
 
+/** 手动勾选删除的状态（SpaceView 提供；缺省空实现保证组件可独立渲染） */
+const noSelection: FileSelection = {
+  selected: ref(new Map<string, number>()),
+  toggle: () => {},
+  clear: () => {},
+};
+const selection = inject(FileSelectionKey, noSelection);
+
 /** 子目录完整路径 */
 function childPath(name: string): string {
   return props.dirPath.endsWith("\\") || props.dirPath.endsWith("/")
     ? props.dirPath + name
     : props.dirPath + "\\" + name;
+}
+
+/** 勾选/取消一个待删除文件（勾选状态集中存放在 SpaceView） */
+function onFileCheck(f: FileEntry, ev: Event) {
+  const checked = (ev.target as HTMLInputElement).checked;
+  selection.toggle(childPath(f.name), f.size, checked);
 }
 
 async function loadChildren() {
@@ -71,11 +88,32 @@ async function loadFiles() {
     files.value = await invoke<FileListing>("list_files", {
       dir: props.dirPath,
       limit: FILE_LIMIT,
+      offset: 0,
     });
   } catch (err) {
     filesError.value = String(err);
   } finally {
     loadingFiles.value = false;
+  }
+}
+
+/** "显示更多文件"：按已加载数作为 offset 追加下一页（后端按大小降序全量排序） */
+const loadingMoreFiles = ref(false);
+async function loadMoreFiles() {
+  if (files.value === null || loadingMoreFiles.value) return;
+  loadingMoreFiles.value = true;
+  filesError.value = "";
+  try {
+    const more = await invoke<FileListing>("list_files", {
+      dir: props.dirPath,
+      limit: FILE_LIMIT,
+      offset: files.value.files.length,
+    });
+    files.value = { files: [...files.value.files, ...more.files], total: more.total };
+  } catch (err) {
+    filesError.value = String(err);
+  } finally {
+    loadingMoreFiles.value = false;
   }
 }
 
@@ -85,6 +123,11 @@ function toggle() {
     loadChildren();
     loadFiles();
   }
+}
+
+/** 截断提示处"显示更多"：每次多放开一页（后端 children() 返回全量，纯前端分段） */
+function showMoreChildren() {
+  childLimit.value += MAX_CHILD_ROWS;
 }
 
 // 根节点默认展开，启动时即加载
@@ -103,6 +146,12 @@ onMounted(() => {
       <span class="name" :title="dirPath">
         {{ node.name }}
         <span v-if="node.unreadable" class="badge" title="无权限读取，大小未知">无权限</span>
+        <span
+          v-else-if="node.unknownSubtree"
+          class="badge"
+          title="子树内存在无权限目录，其大小未计入，实际占用可能更大"
+          >含未知</span
+        >
       </span>
       <span class="meta">{{ humanCount(node.files) }} 文件 · {{ humanCount(node.dirs) }} 目录</span>
       <span class="size">{{ node.unreadable ? "未知" : humanSize(node.size) }}</span>
@@ -138,7 +187,8 @@ onMounted(() => {
           class="file-note"
           :style="{ paddingLeft: (depth + 1) * 20 + 8 + 'px' }"
         >
-          …另有 {{ humanCount(omittedChildren) }} 个子目录（按大小降序，仅显示前 {{ MAX_CHILD_ROWS }}）
+          <span>…按大小降序，还有 {{ humanCount(omittedChildren) }} 个子目录未显示</span>
+          <button class="show-more" @click.stop="showMoreChildren">显示更多</button>
         </div>
       </template>
 
@@ -159,12 +209,26 @@ onMounted(() => {
       </div>
       <template v-else-if="files">
         <div
+          v-if="files.files.length > 0"
+          class="file-note muted"
+          :style="{ paddingLeft: (depth + 1) * 20 + 8 + 'px' }"
+        >
+          （实时读取，可能与扫描时的目录大小快照不同步）
+        </div>
+        <div
           v-for="f in files.files"
           :key="f.name"
           class="row file-row"
           :style="{ paddingLeft: (depth + 1) * 20 + 8 + 'px' }"
         >
-          <span class="caret hidden">▸</span>
+          <input
+            type="checkbox"
+            class="file-check"
+            :checked="selection.selected.value.has(childPath(f.name))"
+            :title="selection.selected.value.has(childPath(f.name)) ? '取消勾选' : '勾选后在底部删除所选'"
+            @click.stop
+            @change="onFileCheck(f, $event)"
+          />
           <span class="name" :title="f.name">{{ f.name }}</span>
           <span class="size">{{ humanSize(f.size) }}</span>
         </div>
@@ -173,7 +237,10 @@ onMounted(() => {
           class="file-note"
           :style="{ paddingLeft: (depth + 1) * 20 + 8 + 'px' }"
         >
-          …还有 {{ humanCount(omittedFiles) }} 个更小的文件未显示
+          <span>…还有 {{ humanCount(omittedFiles) }} 个更小的文件未显示</span>
+          <button class="show-more" :disabled="loadingMoreFiles" @click.stop="loadMoreFiles">
+            {{ loadingMoreFiles ? "加载中…" : "显示更多文件" }}
+          </button>
         </div>
         <div
           v-else-if="files.files.length === 0"
@@ -235,6 +302,14 @@ onMounted(() => {
   cursor: default;
 }
 
+.file-check {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
 .badge {
   display: inline-block;
   margin-left: 6px;
@@ -270,5 +345,25 @@ onMounted(() => {
 
 .file-note.error {
   color: var(--danger);
+}
+
+.file-note.muted {
+  color: var(--text-secondary);
+  opacity: 0.75;
+}
+
+.show-more {
+  margin-left: 8px;
+  padding: 1px 8px;
+  font-size: 12px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.show-more:hover {
+  border-color: var(--accent);
 }
 </style>
