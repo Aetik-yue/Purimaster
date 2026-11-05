@@ -103,17 +103,62 @@ pub fn delete_file(
         return Err(DeleteError::Rejected(e));
     }
 
-    // 6) 回收站可行性预检（dry-run 也会执行，让用户提前看到不可回收的文件）
-    if mode == DeleteMode::Trash {
-        trash_preflight(&canon_file, size).map_err(DeleteError::Rejected)?;
+    delete_checked_canonical(file, &canon_file, size, mode, dry_run)
+}
+
+/// 安全删除单个"用户点名"的文件（空间分析手动勾选删除用），返回文件大小。
+///
+/// 与 [`delete_file`] 的差别：没有批量清理的"目标根"上下文，因此跳过根相关校验
+/// （步骤 1/3/4），但**逐文件安全检查一项不少**——普通文件确认、真实路径保护检查、
+/// 回收站预检、删除前复检全部保留。受保护路径（系统/个人目录/OneDrive）下的文件
+/// 依然会被拒绝。
+pub fn delete_file_standalone(
+    file: &Path,
+    mode: DeleteMode,
+    dry_run: bool,
+) -> Result<u64, DeleteError> {
+    // 普通文件（不跟随链接）
+    let meta = fs::symlink_metadata(file)
+        .map_err(|e| DeleteError::Io(format!("无法读取文件属性：{e}")))?;
+    if !meta.file_type().is_file() {
+        return Err(DeleteError::Rejected(
+            "不是普通文件（链接、目录或特殊文件）".into(),
+        ));
+    }
+    let size = meta.len();
+
+    // 真实路径不得命中保护路径（系统目录、个人目录、OneDrive 等）
+    let canon_file =
+        fs::canonicalize(file).map_err(|e| DeleteError::Io(format!("无法解析文件路径：{e}")))?;
+    if let Err(e) = super::check_target(&canon_file) {
+        return Err(DeleteError::Rejected(e));
     }
 
-    // 7) dry-run 到此为止
+    delete_checked_canonical(file, &canon_file, size, mode, dry_run)
+}
+
+/// 共享删除尾段：回收站预检 → dry-run 门 → 删除前复检 → 按真实路径删除。
+///
+/// 调用方负责完成各自的文件身份与保护校验；从这里开始两条删除路径完全一致
+/// （单点收敛原则，ADR-0003）。
+fn delete_checked_canonical(
+    file: &Path,
+    canon_file: &Path,
+    size: u64,
+    mode: DeleteMode,
+    dry_run: bool,
+) -> Result<u64, DeleteError> {
+    // 回收站可行性预检（dry-run 也会执行，让用户提前看到不可回收的文件）
+    if mode == DeleteMode::Trash {
+        trash_preflight(canon_file, size).map_err(DeleteError::Rejected)?;
+    }
+
+    // dry-run 到此为止
     if dry_run {
         return Ok(size);
     }
 
-    // 8) 删除前最后复检：原路径的真实路径必须仍是 canon_file，随后按真实路径删除
+    // 删除前最后复检：原路径的真实路径必须仍是 canon_file，随后按真实路径删除
     let again = fs::canonicalize(file)
         .map_err(|e| DeleteError::Io(format!("删除前无法解析文件路径：{e}")))?;
     if again != canon_file {
@@ -121,12 +166,67 @@ pub fn delete_file(
     }
     match mode {
         // 使用已解析的真实路径执行删除，缩小路径替换的窗口
-        DeleteMode::Trash => trash::delete(&canon_file)
+        DeleteMode::Trash => trash::delete(canon_file)
             .map_err(|e| DeleteError::Io(format!("移入回收站失败：{e}")))?,
-        DeleteMode::Permanent => fs::remove_file(&canon_file)
+        DeleteMode::Permanent => fs::remove_file(canon_file)
             .map_err(|e| DeleteError::Io(format!("永久删除失败：{e}")))?,
     }
     Ok(size)
+}
+
+/// 删除整个目录树（卸载残留清理用，永久删除语义、无回收站）。
+///
+/// - 目标不得是链接/联接点；canonicalize 后必须通过保护检查（系统/个人目录、
+///   盘符根一律拒绝）——残留目录由名称匹配产生，这条检查是最后防线
+/// - `dry_run = true` 时只做检查不删除
+/// - 内部使用 `fs::remove_dir_all`：不跟随符号链接（链接本身被移除，目标保留）
+pub fn remove_dir_tree_standalone(dir: &Path, dry_run: bool) -> Result<u64, DeleteError> {
+    let meta =
+        fs::symlink_metadata(dir).map_err(|e| DeleteError::Io(format!("无法读取目录属性：{e}")))?;
+    if meta.file_type().is_symlink() {
+        return Err(DeleteError::Rejected("目标是链接或联接点，拒绝删除".into()));
+    }
+    if !meta.is_dir() {
+        return Err(DeleteError::Rejected("不是目录".into()));
+    }
+    let real =
+        fs::canonicalize(dir).map_err(|e| DeleteError::Io(format!("无法解析目录路径：{e}")))?;
+    super::check_target(&real).map_err(DeleteError::Rejected)?;
+
+    // 统计内容规模（dry-run 报告与真实删除共用；上限防御异常深/大的树）
+    let mut total_files: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    let mut stack = vec![real.clone()];
+    let mut visited = 0usize;
+    while let Some(d) = stack.pop() {
+        visited += 1;
+        if visited > 100_000 {
+            return Err(DeleteError::Rejected(
+                "目录规模异常（超过 10 万项），拒绝删除".into(),
+            ));
+        }
+        let Ok(entries) = fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file() {
+                total_files += 1;
+                if let Ok(m) = entry.metadata() {
+                    total_bytes += m.len();
+                }
+            }
+        }
+    }
+
+    if dry_run {
+        return Ok(total_files);
+    }
+    fs::remove_dir_all(&real).map_err(|e| DeleteError::Io(format!("删除目录失败：{e}")))?;
+    let _ = total_bytes;
+    Ok(total_files)
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +345,120 @@ mod tests {
         let size = delete_file(dir.path(), &file, DeleteMode::Permanent, true).unwrap();
         assert_eq!(size, 42);
         assert!(file.exists(), "dry-run 不得删除文件");
+    }
+
+    // -----------------------------------------------------------------------
+    // delete_file_standalone（用户点名单文件删除）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn standalone_dry_run_keeps_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = temp_file(dir.path(), "picked.bin", 42);
+        let size = delete_file_standalone(&file, DeleteMode::Permanent, true).unwrap();
+        assert_eq!(size, 42);
+        assert!(file.exists(), "dry-run 不得删除文件");
+    }
+
+    #[test]
+    fn standalone_permanent_removes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = temp_file(dir.path(), "picked.bin", 10);
+        delete_file_standalone(&file, DeleteMode::Permanent, false).unwrap();
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn standalone_rejects_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            delete_file_standalone(dir.path(), DeleteMode::Permanent, true),
+            Err(DeleteError::Rejected(_))
+        ));
+    }
+
+    #[test]
+    fn standalone_rejects_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("__no_such__.bin");
+        assert!(matches!(
+            delete_file_standalone(&missing, DeleteMode::Permanent, true),
+            Err(DeleteError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn standalone_rejects_protected_file() {
+        // 真实系统路径保护：System32 下的文件即使被用户点名也必须拒绝；
+        // 依赖真实环境，缺失时跳过（显式打印避免假绿）
+        let Some(sysroot) = std::env::var_os("SystemRoot") else {
+            eprintln!("跳过：SystemRoot 不可用");
+            return;
+        };
+        let hosts = PathBuf::from(sysroot)
+            .join("System32")
+            .join("drivers")
+            .join("etc")
+            .join("hosts");
+        if !hosts.is_file() {
+            eprintln!("跳过：hosts 文件不存在");
+            return;
+        }
+        assert!(matches!(
+            delete_file_standalone(&hosts, DeleteMode::Permanent, true),
+            Err(DeleteError::Rejected(_))
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // remove_dir_tree_standalone（卸载残留目录删除）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dir_tree_dry_run_counts_but_keeps() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("a.bin"), [0u8; 10]).unwrap();
+        fs::write(dir.path().join("sub").join("b.bin"), [0u8; 20]).unwrap();
+
+        let count = remove_dir_tree_standalone(dir.path(), true).unwrap();
+        assert_eq!(count, 2);
+        assert!(dir.path().join("a.bin").exists(), "dry-run 不得删除");
+    }
+
+    #[test]
+    fn dir_tree_removes_nested_content() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("deep").join("er")).unwrap();
+        fs::write(dir.path().join("deep").join("er").join("x.bin"), [0u8; 5]).unwrap();
+
+        remove_dir_tree_standalone(dir.path(), false).unwrap();
+        assert!(!dir.path().exists(), "目录树应被整体删除");
+    }
+
+    #[test]
+    fn dir_tree_rejects_drive_root() {
+        assert!(matches!(
+            remove_dir_tree_standalone(Path::new(r"C:\"), true),
+            Err(DeleteError::Rejected(_))
+        ));
+    }
+
+    #[test]
+    fn dir_tree_rejects_protected_dir() {
+        let Some(sysroot) = std::env::var_os("SystemRoot") else {
+            eprintln!("跳过：SystemRoot 不可用");
+            return;
+        };
+        let system32 = PathBuf::from(sysroot).join("System32");
+        if !system32.is_dir() {
+            eprintln!("跳过：System32 不存在");
+            return;
+        }
+        assert!(matches!(
+            remove_dir_tree_standalone(&system32, true),
+            Err(DeleteError::Rejected(_))
+        ));
     }
 
     #[test]
