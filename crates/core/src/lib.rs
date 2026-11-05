@@ -54,6 +54,8 @@ pub struct NodeSummary {
     pub dirs: u64,
     /// 因权限等原因未能读取：大小未知，区别于空目录。
     pub unreadable: bool,
+    /// 自身可读，但子树内存在无权限目录：总大小不含这部分，UI 应提示"可能更大"。
+    pub unknown_subtree: bool,
     pub has_children: bool,
 }
 
@@ -66,6 +68,7 @@ struct NodeRecord {
     files: u64,
     dirs: u64,
     unreadable: bool,
+    unknown_subtree: bool,
 }
 
 /// 一次扫描的完整结果索引（扁平存储，不递归）。
@@ -75,6 +78,8 @@ pub struct ScanIndex {
     pub bytes_seen: u64,
     /// 因权限不足等原因无法读取而跳过的条目数。
     pub skipped: u64,
+    /// 被跳过的符号链接/联接点数量（防环路，不入树不计大小）。
+    pub junctions: u64,
 }
 
 impl ScanIndex {
@@ -96,6 +101,7 @@ impl ScanIndex {
             files: n.files,
             dirs: n.dirs,
             unreadable: n.unreadable,
+            unknown_subtree: n.unknown_subtree,
             has_children: !n.children.is_empty(),
         })
     }
@@ -142,11 +148,11 @@ pub struct FileListing {
     pub total: u64,
 }
 
-/// 列出 `dir` 下直属文件（不含子目录），按大小降序，最多返回 `limit` 条。
+/// 列出 `dir` 下直属文件（不含子目录），按大小降序，返回第 `offset` 起的最多 `limit` 条。
 ///
-/// `total` 为截断前总数，便于前端提示"还有 N 个未显示"。
+/// `total` 为排序后的全量文件数，便于前端分页提示"还有 N 个未显示"。
 /// 条目级读取失败会被跳过（展示辅助接口，尽力而为）；目录本身打不开才返回错误。
-pub fn list_files(dir: &Path, limit: usize) -> Result<FileListing, ScanError> {
+pub fn list_files(dir: &Path, limit: usize, offset: usize) -> Result<FileListing, ScanError> {
     if !dir.is_dir() {
         return Err(ScanError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -169,7 +175,8 @@ pub fn list_files(dir: &Path, limit: usize) -> Result<FileListing, ScanError> {
     }
     let total = files.len() as u64;
     files.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
-    files.truncate(limit);
+    files.truncate(limit.saturating_add(offset));
+    files.drain(..offset.min(files.len()));
     Ok(FileListing { files, total })
 }
 
@@ -177,6 +184,8 @@ pub fn list_files(dir: &Path, limit: usize) -> Result<FileListing, ScanError> {
 struct WalkCtx<'a> {
     cancel: &'a AtomicBool,
     skipped: AtomicU64,
+    /// 符号链接/联接点计数（既非普通目录也非普通文件的条目）
+    junctions: AtomicU64,
     tx: mpsc::Sender<DirRecord>,
 }
 
@@ -210,6 +219,7 @@ pub fn scan_space(
 
     let (tx, rx) = mpsc::channel::<DirRecord>();
     let mut skipped_total: u64 = 0;
+    let mut junctions_total: u64 = 0;
 
     // 聚合状态：路径 → node id 的临时映射（扫描结束即丢弃，不留内存）
     let mut path_ids: HashMap<PathBuf, u32> = HashMap::new();
@@ -224,6 +234,7 @@ pub fn scan_space(
         files: 0,
         dirs: 0,
         unreadable: false,
+        unknown_subtree: false,
     });
 
     let mut files_seen: u64 = 0;
@@ -237,13 +248,20 @@ pub fn scan_space(
             let ctx = WalkCtx {
                 cancel,
                 skipped: AtomicU64::new(0),
+                junctions: AtomicU64::new(0),
                 tx,
             };
             scope_fifo(|scope| walk_dir(root.clone(), &ctx, scope));
-            ctx.skipped.load(Ordering::Relaxed)
+            (
+                ctx.skipped.load(Ordering::Relaxed),
+                ctx.junctions.load(Ordering::Relaxed),
+            )
         });
 
         // 消费线程：为目录链分配 arena id、聚合统计、回调进度
+        // （ids 缓冲跨记录复用：每条记录一次 Vec 分配是与 I/O 无关的纯 CPU
+        // 开销，全盘扫描目录数为数十万级）
+        let mut ids: Vec<u32> = Vec::new();
         for rec in rx {
             if rec.path == root && rec.unreadable {
                 root_unreadable = true;
@@ -252,7 +270,7 @@ pub fn scan_space(
             bytes_seen += rec.direct_size;
 
             // 收集自身与祖先（含扫描根）的节点 id 链：ids[0]=自身，末尾=根
-            let mut ids: Vec<u32> = Vec::new();
+            ids.clear();
             for anc in rec.path.ancestors().take_while(|p| p.starts_with(&root)) {
                 ids.push(get_or_create(anc, &mut path_ids, &mut nodes));
             }
@@ -287,7 +305,10 @@ pub fn scan_space(
         }
 
         match walker.join() {
-            Ok(n) => skipped_total = n,
+            Ok((n, j)) => {
+                skipped_total = n;
+                junctions_total = j;
+            }
             // 遍历线程异常终止：不允许静默返回部分结果，转为显式错误
             Err(_) => walker_panicked = true,
         }
@@ -326,6 +347,9 @@ pub fn scan_space(
         nodes[i].children = ch;
     }
 
+    // "子树含未知大小"标记沿祖先链传播（沿 parent 上溯，已标记即早停）
+    propagate_unknown_subtree(&mut nodes);
+
     // 收尾进度：无论规模大小都保证调用方拿到最终计数
     progress(ScanProgress {
         files_seen,
@@ -337,7 +361,29 @@ pub fn scan_space(
         files_seen,
         bytes_seen,
         skipped: skipped_total,
+        junctions: junctions_total,
     })
+}
+
+/// 把"子树内存在无权限目录"的标记传播给全部祖先。
+///
+/// 无权限目录自身已有 `unreadable` 标记，但其大小静默不计入祖先的聚合值——
+/// 不传播的话，中间层级看起来"就这么大"，用户对不上数字却无从解释。
+fn propagate_unknown_subtree(nodes: &mut [NodeRecord]) {
+    for i in 0..nodes.len() {
+        if !nodes[i].unreadable {
+            continue;
+        }
+        let mut p = nodes[i].parent;
+        while p != NO_PARENT && (p as usize) < nodes.len() {
+            let parent = p as usize;
+            if nodes[parent].unknown_subtree {
+                break; // 已标记：其祖先必然也已标记
+            }
+            nodes[parent].unknown_subtree = true;
+            p = nodes[parent].parent;
+        }
+    }
 }
 
 /// 取路径的目录名；根目录（如 `C:\`）无 file_name 时返回完整路径。
@@ -371,6 +417,7 @@ fn get_or_create(
         files: 0,
         dirs: 0,
         unreadable: false,
+        unknown_subtree: false,
     });
     path_ids.insert(path.to_path_buf(), id);
     id
@@ -385,20 +432,18 @@ fn walk_dir<'env>(path: PathBuf, ctx: &'env WalkCtx<'env>, scope: &rayon::ScopeF
     if ctx.cancel.load(Ordering::Relaxed) {
         return;
     }
-    // 慢目录追踪（诊断用）：PURIMASTER_TRACE_SLOW=1 时，单目录遍历超过 2 秒打印路径
+    // 慢目录追踪（诊断用）：PURIMASTER_TRACE_SLOW=1 时，单目录遍历超过 2 秒打印路径。
+    // Instant 只在开关开启时取——默认关（Windows 上一次 QPC 调用 × 数十万目录纯属浪费）
     let trace_slow = trace_slow_enabled();
-    let started = std::time::Instant::now();
-    let mut rec = DirRecord {
-        path: path.clone(),
-        direct_files: 0,
-        direct_size: 0,
-        unreadable: false,
-    };
+    let started = trace_slow.then(std::time::Instant::now);
+    let mut direct_files = 0u64;
+    let mut direct_size = 0u64;
+    let mut unreadable = false;
     match fs::read_dir(&path) {
         Ok(entries) => {
             for entry in entries {
                 if ctx.cancel.load(Ordering::Relaxed) {
-                    return; // 不发送 rec：已取消，结果将被丢弃
+                    return; // 不发送记录：已取消，结果将被丢弃
                 }
                 let Ok(entry) = entry else {
                     ctx.skipped.fetch_add(1, Ordering::Relaxed);
@@ -415,30 +460,42 @@ fn walk_dir<'env>(path: PathBuf, ctx: &'env WalkCtx<'env>, scope: &rayon::ScopeF
                     // std 的 DirEntry::metadata 在 Windows 上零额外系统调用
                     match entry.metadata() {
                         Ok(m) => {
-                            rec.direct_files += 1;
-                            rec.direct_size += m.len();
+                            direct_files += 1;
+                            direct_size += m.len();
                         }
                         Err(_) => {
                             ctx.skipped.fetch_add(1, Ordering::Relaxed);
                         }
                     }
+                } else {
+                    // 符号链接/联接点：防环路不入树不计大小，但显式计数，
+                    // 让 UI 能解释"数字为什么与资源管理器对不上"
+                    ctx.junctions.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
         Err(_) => {
-            // 目录本身读不了（如无权限）：大小未知，标记 unreadable，仍发送 rec
-            rec.unreadable = true;
+            // 目录本身读不了（如无权限）：大小未知，标记 unreadable，仍发送记录
+            unreadable = true;
             ctx.skipped.fetch_add(1, Ordering::Relaxed);
         }
     }
-    if trace_slow && started.elapsed().as_secs_f32() > 2.0 {
+    if let Some(started) = started
+        && started.elapsed().as_secs_f32() > 2.0
+    {
         eprintln!(
             "[slow-dir {:.1}s] {}",
             started.elapsed().as_secs_f32(),
             path.display()
         );
     }
-    let _ = ctx.tx.send(rec);
+    // 记录发送前才构造，path 直接 move（省去每目录一次完整路径的堆分配+拷贝）
+    let _ = ctx.tx.send(DirRecord {
+        path,
+        direct_files,
+        direct_size,
+        unreadable,
+    });
 }
 
 #[cfg(test)]
@@ -513,6 +570,40 @@ mod tests {
     }
 
     #[test]
+    fn sibling_branches_aggregate_into_shared_ancestors() {
+        // perf-3 回归：消费循环的祖先 id 缓冲改为跨记录复用（clear + 重建）后，
+        // 每条目录记录的祖先链聚合仍须逐链正确——多条兄弟分支共享祖先时，
+        // 上一条记录残留的 id 不得污染本条的父链建立与尺寸累计。
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let a_sub = a.join("sub");
+        let b = dir.path().join("b");
+        fs::create_dir_all(&a_sub).unwrap();
+        fs::create_dir(&b).unwrap();
+        fs::write(a.join("f1.bin"), [0u8; 10]).unwrap();
+        fs::write(a_sub.join("f2.bin"), [0u8; 20]).unwrap();
+        fs::write(b.join("f3.bin"), [0u8; 40]).unwrap();
+
+        let idx = scan(dir.path(), &AtomicBool::new(false)).unwrap();
+        let root = root_of(&idx);
+        assert_eq!(root.files, 3);
+        assert_eq!(root.size, 70);
+        assert_eq!(root.dirs, 3, "a、a/sub、b 三条记录都应落在根上");
+
+        let children = idx.children(idx.root_id());
+        let sa = children.iter().find(|c| c.name == "a").unwrap();
+        assert_eq!(sa.size, 30, "a 应含自身与 sub 的文件");
+        assert_eq!(sa.files, 2);
+        assert_eq!(sa.dirs, 1, "只有 sub 一层子目录");
+        assert!(sa.has_children);
+        let sb = children.iter().find(|c| c.name == "b").unwrap();
+        assert_eq!(sb.size, 40);
+        assert_eq!(sb.files, 1);
+        assert_eq!(sb.dirs, 0);
+        assert!(!sb.has_children);
+    }
+
+    #[test]
     fn cancel_stops_scan() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), [0u8; 1]).unwrap();
@@ -558,7 +649,7 @@ mod tests {
         fs::write(dir.path().join("small.txt"), [0u8; 10]).unwrap();
         fs::create_dir(dir.path().join("subdir")).unwrap();
 
-        let listing = list_files(dir.path(), 100).unwrap();
+        let listing = list_files(dir.path(), 100, 0).unwrap();
         let names: Vec<&str> = listing.files.iter().map(|f| f.name.as_str()).collect();
         // 只含文件、不含子目录，按大小降序
         assert_eq!(names, ["big.bin", "small.txt"]);
@@ -576,7 +667,7 @@ mod tests {
             )
             .unwrap();
         }
-        let listing = list_files(dir.path(), 3).unwrap();
+        let listing = list_files(dir.path(), 3, 0).unwrap();
         assert_eq!(listing.files.len(), 3);
         assert_eq!(listing.total, 10);
         // 截断后仍是最大的三个：9、8、7 字节
@@ -585,9 +676,37 @@ mod tests {
     }
 
     #[test]
+    fn list_files_offset_pages_through_sorted_list() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..10u8 {
+            fs::write(
+                dir.path().join(format!("f{i}.bin")),
+                vec![0u8; i as usize + 1],
+            )
+            .unwrap();
+        }
+        // 第一页：3 条（10、9、8）
+        let page1 = list_files(dir.path(), 3, 0).unwrap();
+        assert_eq!(page1.total, 10);
+        assert_eq!(page1.files.len(), 3);
+        // 第二页：接续第 3 条（7、6、5）
+        let page2 = list_files(dir.path(), 3, 3).unwrap();
+        assert_eq!(page2.total, 10);
+        assert_eq!(page2.files[0].size, 7);
+        // 尾页：只剩 1 条
+        let tail = list_files(dir.path(), 3, 9).unwrap();
+        assert_eq!(tail.files.len(), 1);
+        assert_eq!(tail.files[0].size, 1);
+        // 越界：空列表但 total 仍正确
+        let beyond = list_files(dir.path(), 3, 99).unwrap();
+        assert!(beyond.files.is_empty());
+        assert_eq!(beyond.total, 10);
+    }
+
+    #[test]
     fn list_files_missing_dir_is_error() {
         assert!(matches!(
-            list_files(Path::new("Z:\\__no_such_dir_purimaster__"), 100),
+            list_files(Path::new("Z:\\__no_such_dir_purimaster__"), 100, 0),
             Err(ScanError::Io(_))
         ));
     }
@@ -602,5 +721,52 @@ mod tests {
         assert_eq!(idx.files_seen, 1);
         // 小扫描也要收到收尾进度，保证前端能拿到最终计数
         assert_eq!(calls.last().map(|p| p.files_seen), Some(1));
+    }
+
+    fn node(name: &str, parent: u32) -> NodeRecord {
+        NodeRecord {
+            name: name.into(),
+            parent,
+            children: Vec::new(),
+            size: 0,
+            files: 0,
+            dirs: 0,
+            unreadable: false,
+            unknown_subtree: false,
+        }
+    }
+
+    #[test]
+    fn unknown_subtree_propagates_to_all_ancestors() {
+        // root(0) ← mid(1) ← leaf(2, unreadable)；兄弟分支 sibling(1) 不受影响
+        let mut nodes = vec![node("root", NO_PARENT), node("mid", 0), node("leaf", 1)];
+        nodes[0].children = vec![1];
+        nodes[1].children = vec![2];
+        nodes[2].unreadable = true;
+
+        propagate_unknown_subtree(&mut nodes);
+
+        assert!(nodes[1].unknown_subtree, "直接父节点应被标记");
+        assert!(nodes[0].unknown_subtree, "根节点应被标记");
+        assert!(
+            !nodes[2].unknown_subtree,
+            "自身用 unreadable 表达，无需 unknown 标记"
+        );
+    }
+
+    #[test]
+    fn unknown_subtree_propagation_stops_at_marked_ancestor() {
+        // 两条无权限分支共享祖先：祖先只标记一次（早停，避免重复上溯）
+        let mut nodes = vec![node("root", NO_PARENT), node("a", 0), node("b", 0)];
+        nodes[0].children = vec![1, 2];
+        nodes[1].unreadable = true;
+        nodes[2].unreadable = true;
+
+        propagate_unknown_subtree(&mut nodes);
+
+        assert!(nodes[0].unknown_subtree);
+        // a/b 自身 unreadable，unknown_subtree 保持 false
+        assert!(!nodes[1].unknown_subtree);
+        assert!(!nodes[2].unknown_subtree);
     }
 }

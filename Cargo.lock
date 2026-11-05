@@ -2405,6 +2405,7 @@ name = "purimaster"
 version = "0.1.0"
 dependencies = [
  "purimaster-core",
+ "purimaster-platform",
  "purimaster-rules",
  "serde",
  "serde_json",
@@ -2426,6 +2427,7 @@ name = "purimaster-platform"
 version = "0.1.0"
 dependencies = [
  "dirs 6.0.0",
+ "serde",
  "tempfile",
  "trash",
  "windows-sys 0.59.0",
@@ -2435,11 +2437,14 @@ dependencies = [
 name = "purimaster-rules"
 version = "0.1.0"
 dependencies = [
+ "glob",
  "globset",
  "purimaster-platform",
  "serde",
+ "serde_json",
  "tempfile",
  "toml 0.8.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

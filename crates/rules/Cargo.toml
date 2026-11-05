@@ -9,6 +9,14 @@ purimaster-platform = { path = "../platform" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 globset = "0.4"
+glob = "0.3"
 
 [dev-dependencies]
+serde_json = "1"
 tempfile = "3"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }

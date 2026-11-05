@@ -25,8 +25,17 @@ use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 pub mod delete;
+pub mod registry;
+pub mod uninstall;
 
-pub use delete::{DeleteError, DeleteMode, delete_file};
+pub use delete::{
+    DeleteError, DeleteMode, delete_file, delete_file_standalone, remove_dir_tree_standalone,
+};
+pub use registry::delete_registry_tree;
+pub use uninstall::{
+    InstalledProgram, ResidueDir, ResidueReport, list_installed_programs, run_uninstaller,
+    scan_residue,
+};
 
 /// 保护路径配置。
 #[derive(Debug, Clone, Default)]
@@ -36,11 +45,19 @@ pub struct Protection {
 }
 
 /// 读取当前系统的保护路径（环境变量可能在测试/受限环境中缺失，缺失项自动跳过）。
+///
+/// 进程级缓存：Known Folder API 与环境变量在进程生命周期内不会变化，而
+/// `check_target` 在删除路径上逐文件调用本函数（每文件两次，见 delete.rs），
+/// 不缓存的话清理 1 万个文件要重复构建约 2 万次保护列表。
+/// 测试需要多套保护配置时，直接构造 `Protection` 走 [`check_target_against`]。
 pub fn protection() -> Protection {
-    Protection {
-        sensitive: sensitive_roots(),
-        ancestor_only: ancestor_only_roots(),
-    }
+    static CACHE: std::sync::OnceLock<Protection> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| Protection {
+            sensitive: sensitive_roots(),
+            ancestor_only: ancestor_only_roots(),
+        })
+        .clone()
 }
 
 fn sensitive_roots() -> Vec<PathBuf> {
@@ -192,8 +209,89 @@ fn is_drive_root(path: &Path) -> bool {
     has_prefix && has_root && components.next().is_none()
 }
 
-/// 规范化：去掉 `\\?\` / `\\?\UNC\` 前缀、小写、正斜杠转反斜杠、去掉末尾分隔符。
-fn normalize(path: &Path) -> String {
+// ---------------------------------------------------------------------------
+// 盘符枚举（空间分析页的快捷入口用）
+// ---------------------------------------------------------------------------
+
+/// 一个可用盘符。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DriveInfo {
+    /// 盘符根路径，如 `"C:\"`
+    pub root: String,
+    /// `"fixed"` | `"removable"` | `"network"` | `"cdrom"` | `"ramdisk"` | `"unknown"`
+    pub kind: &'static str,
+}
+
+/// 枚举本机全部可用盘符（Windows：GetLogicalDriveStringsW + GetDriveTypeW）。
+#[cfg(windows)]
+pub fn list_drives() -> Vec<DriveInfo> {
+    use std::os::windows::ffi::OsStrExt;
+
+    /// GetDriveTypeW 结果 → 稳定字符串标识
+    fn kind_of(drive_type: u32) -> &'static str {
+        match drive_type {
+            windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED => "fixed",
+            windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOVABLE => "removable",
+            windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE => "network",
+            windows_sys::Win32::System::WindowsProgramming::DRIVE_CDROM => "cdrom",
+            windows_sys::Win32::System::WindowsProgramming::DRIVE_RAMDISK => "ramdisk",
+            _ => "unknown",
+        }
+    }
+
+    // 两次调用：先取所需长度，再取实际内容
+    let len = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetLogicalDriveStringsW(0, std::ptr::null_mut())
+    };
+    if len == 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u16; len as usize];
+    let written = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetLogicalDriveStringsW(len, buf.as_mut_ptr())
+    };
+    if written == 0 {
+        return Vec::new();
+    }
+    buf.truncate(written as usize);
+
+    let roots = String::from_utf16_lossy(&buf);
+    roots
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(|root| {
+            let wide: Vec<u16> = std::ffi::OsStr::new(root)
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            let drive_type =
+                unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(wide.as_ptr()) };
+            DriveInfo {
+                root: root.to_string(),
+                kind: kind_of(drive_type),
+            }
+        })
+        .collect()
+}
+
+/// 非 Windows 平台：无盘符概念，返回空列表（调用方按空态展示）。
+#[cfg(not(windows))]
+pub fn list_drives() -> Vec<DriveInfo> {
+    Vec::new()
+}
+
+/// Windows 路径比较键：去掉 `\\?\` / `\\?\UNC\` 前缀、全 Unicode 小写折叠、
+/// 正斜杠转反斜杠、去掉末尾分隔符。
+///
+/// 公开给 `purimaster-rules` 复用：路径去重（scan/clean 归属统计）与保护检查
+/// 必须使用**同一个**比较键，否则两种拼法（如 `…\Jürgen` 与 `…\JÜRGEN`）在
+/// 保护检查眼里是同一目录、在去重眼里却是两个——确认统计会虚高。
+///
+/// 大小写折叠用 `str::to_lowercase`（NTFS 的 $UpCase 表覆盖全 Unicode，
+/// ASCII 小写化不够）；纯 ASCII 输入走 std 内建快速路径，开销与
+/// `to_ascii_lowercase` 同级。折叠范围偏大在本项目里是安全方向：
+/// 去重少计（不漏删），保护检查多拦（不放过）。
+pub fn normalize(path: &Path) -> String {
     let raw = path.to_string_lossy();
     let stripped = if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")
@@ -202,7 +300,7 @@ fn normalize(path: &Path) -> String {
     } else {
         raw.into_owned()
     };
-    let mut s = stripped.replace('/', "\\").to_ascii_lowercase();
+    let mut s = stripped.replace('/', "\\").to_lowercase();
     while s.len() > 3 && s.ends_with('\\') {
         s.pop();
     }
