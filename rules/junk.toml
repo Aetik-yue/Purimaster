@@ -5,14 +5,33 @@
 #
 # 约定：
 # - paths 支持 %VAR% 环境变量（Windows 约定），路径必须展开为绝对路径
+# - paths 支持通配符（* / ?）：按当前文件系统展开为现存目录，
+#   `*` 不跨越路径分隔符（可安全枚举 User Data 下的多 Profile 目录）
 # - include 为空表示包含全部；exclude 优先于 include
 # - glob 相对目标目录、`/` 分隔、大小写不敏感
 # - risk: low | medium | high（UI 据此决定清理时的确认强度）
+# - scan_only: true 表示仅扫描展示、不参与清理（目标有条件限制时使用）
+# - min_age: 只统计/清理修改时间早于该时长的文件（"24h"/"7d"/"2w"）。
+#   正在使用的临时/缓存文件几乎总是新写的——对近期文件网开一面是
+#   行业标准安全启发式（CCleaner 对 Windows Temp 默认只清理 24 小时前的文件）
+# - description: 面向用户的一句话说明，展示在清理详情里（这个目录是什么、为什么可清）
 # - 目标不存在（应用未安装等）会被静默跳过
+#
+# 明确不做（有依据的克制，勿随手添加）：
+# - %SystemRoot%\Prefetch——微软官方说明：Prefetch 是加速启动的性能缓存而非垃圾，
+#   删除后应用启动反而变慢，体积上限约 1 MB，清理零收益（windowslatest.com 2026-10）
+# - 浏览器 Cookies / Login Data / 网站登录态——会强制登出所有网站
+# - Delivery Optimization 缓存（ServiceProfiles\NetworkService\...\DeliveryOptimization）——
+#   服务占用中 + 需管理员，官方途径是磁盘清理工具的"传递优化文件"
+# - %USERPROFILE%\.nuget\packages 等包管理器"实体包"目录——删除破坏离线还原；
+#   只清各包管理器官方声明可清的 cache 目录
+# - %SystemRoot%\LiveKernelReports——标准用户无读取权限，扫描只会产生噪音
 
 [categories]
 temp = "临时文件"
 browser-cache = "浏览器缓存"
+app-cache = "应用缓存"
+dev-cache = "开发工具缓存"
 system-residue = "系统残留"
 crash-dump = "崩溃转储"
 
@@ -21,6 +40,8 @@ id = "user-temp"
 category = "temp"
 title = "用户临时目录"
 risk = "low"
+description = "应用运行时存放的临时文件。24 小时内的文件可能正在使用，只清理更早的。"
+min_age = "24h"
 paths = [
   '%TEMP%',
   '%LOCALAPPDATA%\Temp',
@@ -31,6 +52,8 @@ id = "system-temp"
 category = "temp"
 title = "系统临时目录"
 risk = "low"
+description = "Windows 系统级临时目录，权限不足的子目录会自动跳过并提示。"
+min_age = "24h"
 paths = ['%SystemRoot%\Temp']
 
 [[rule]]
@@ -38,11 +61,12 @@ id = "chrome-cache"
 category = "browser-cache"
 title = "Chrome 缓存"
 risk = "low"
-# 注：MVP 只覆盖 Default Profile，后续版本遍历 User Data 下所有 Profile
+description = "网页缓存（图片、脚本等），删除后浏览器按需重新下载，不影响登录状态与历史记录。覆盖所有 Profile。"
+min_age = "24h"
 paths = [
-  '%LOCALAPPDATA%\Google\Chrome\User Data\Default\Cache',
-  '%LOCALAPPDATA%\Google\Chrome\User Data\Default\Code Cache',
-  '%LOCALAPPDATA%\Google\Chrome\User Data\Default\GPUCache',
+  '%LOCALAPPDATA%\Google\Chrome\User Data\*\Cache',
+  '%LOCALAPPDATA%\Google\Chrome\User Data\*\Code Cache',
+  '%LOCALAPPDATA%\Google\Chrome\User Data\*\GPUCache',
 ]
 
 [[rule]]
@@ -50,18 +74,126 @@ id = "edge-cache"
 category = "browser-cache"
 title = "Edge 缓存"
 risk = "low"
+description = "同 Chrome 的网页缓存机制。删除后按需重新下载，不影响登录状态。覆盖所有 Profile。"
+min_age = "24h"
 paths = [
-  '%LOCALAPPDATA%\Microsoft\Edge\User Data\Default\Cache',
-  '%LOCALAPPDATA%\Microsoft\Edge\User Data\Default\Code Cache',
-  '%LOCALAPPDATA%\Microsoft\Edge\User Data\Default\GPUCache',
+  '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\Cache',
+  '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\Code Cache',
+  '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\GPUCache',
 ]
+
+[[rule]]
+id = "firefox-cache"
+category = "browser-cache"
+title = "Firefox 缓存"
+risk = "low"
+description = "Firefox 的网页缓存目录（cache2），删除后按需重新下载。覆盖所有 Profile。"
+min_age = "24h"
+paths = [
+  '%LOCALAPPDATA%\Mozilla\Firefox\Profiles\*\cache2',
+]
+
+# 以下 Electron/Chromium 系应用缓存均只清理三件套（Cache/Code Cache/GPUCache），
+# 与 BleachBit 的 discord.xml/vscode.xml 同一套路——这些都是 Chromium 标准可丢弃缓存；
+# 不碰各应用的 Network Persistent State / Preferences / Session Storage 等设置数据
+
+[[rule]]
+id = "vscode-cache"
+category = "app-cache"
+title = "VS Code 缓存"
+risk = "low"
+description = "编辑器界面缓存，删除后自动重建。不影响设置、扩展与最近打开的项目。"
+min_age = "24h"
+paths = [
+  '%APPDATA%\Code\Cache',
+  '%APPDATA%\Code\CachedData',
+  '%APPDATA%\Code\Code Cache',
+  '%APPDATA%\Code\GPUCache',
+]
+
+[[rule]]
+id = "discord-cache"
+category = "app-cache"
+title = "Discord 缓存"
+risk = "low"
+description = "聊天图片/表情缓存，删除后重新下载。Discord 运行中时个别文件会失败，属正常。"
+min_age = "24h"
+paths = [
+  '%APPDATA%\discord\Cache',
+  '%APPDATA%\discord\Code Cache',
+  '%APPDATA%\discord\GPUCache',
+]
+
+[[rule]]
+id = "slack-cache"
+category = "app-cache"
+title = "Slack 缓存"
+risk = "low"
+description = "工作区图片/文件预览缓存，删除后重新下载。Slack 运行中时个别文件会失败，属正常。"
+min_age = "24h"
+paths = [
+  '%APPDATA%\Slack\Cache',
+  '%APPDATA%\Slack\Code Cache',
+  '%APPDATA%\Slack\GPUCache',
+  '%APPDATA%\Slack\Service Worker\CacheStorage',
+]
+
+[[rule]]
+id = "npm-cache"
+category = "dev-cache"
+title = "npm 包缓存"
+risk = "low"
+description = "npm 下载包的内容寻址缓存，等价于官方的 npm cache clean --force，下次安装自动重新下载。"
+min_age = "24h"
+paths = ['%LOCALAPPDATA%\npm-cache']
+
+[[rule]]
+id = "pip-cache"
+category = "dev-cache"
+title = "pip 包缓存"
+risk = "low"
+description = "Python 包安装缓存，等价于官方的 pip cache purge，下次安装自动重新下载。"
+min_age = "24h"
+paths = ['%LOCALAPPDATA%\pip\cache']
+
+[[rule]]
+id = "yarn-cache"
+category = "dev-cache"
+title = "Yarn 包缓存"
+risk = "low"
+description = "Yarn 经典版（v1）的包下载缓存，下次安装自动重新下载。"
+min_age = "24h"
+paths = ['%LOCALAPPDATA%\Yarn\Cache']
+
+[[rule]]
+id = "directx-shader-cache"
+category = "system-residue"
+title = "DirectX 着色器缓存"
+risk = "low"
+description = "游戏/应用编译好的 GPU 着色器缓存，删除后自动重建，代价是下次启动游戏可能短暂卡顿——因此只清理 7 天前的旧缓存。"
+min_age = "7d"
+paths = [
+  '%LOCALAPPDATA%\D3DSCache',
+  '%LOCALAPPDATA%\Microsoft\DirectX Shader Cache',
+]
+
+[[rule]]
+id = "inet-cache"
+category = "system-residue"
+title = "Windows 系统网络缓存"
+risk = "low"
+description = "WinINET/IE 兼容层的系统网络缓存（不少桌面应用仍在使用），与浏览器登录状态无关。"
+min_age = "24h"
+paths = ['%LOCALAPPDATA%\Microsoft\Windows\INetCache']
 
 [[rule]]
 id = "windows-update-download"
 category = "system-residue"
 title = "Windows 更新下载缓存"
 risk = "medium"
-# 内容可重新下载；清理前应确认更新服务空闲（v0.1 阶段只扫描不删除）
+description = "已安装更新的安装包缓存，内容可重新下载。更新服务运行中时文件可能被占用，因此仅展示、不自动清理。"
+# scan_only：更新服务运行中时文件被占用，删除会大量报错——留给系统磁盘清理工具
+scan_only = true
 paths = ['%SystemRoot%\SoftwareDistribution\Download']
 
 [[rule]]
@@ -69,6 +201,7 @@ id = "wer-reports"
 category = "system-residue"
 title = "Windows 错误报告"
 risk = "low"
+description = "应用崩溃后自动生成的错误报告存档，仅用于微软的诊断统计，普通用户无需保留。"
 paths = [
   '%LOCALAPPDATA%\Microsoft\Windows\WER\ReportArchive',
   '%LOCALAPPDATA%\Microsoft\Windows\WER\ReportQueue',
@@ -77,10 +210,20 @@ paths = [
 ]
 
 [[rule]]
+id = "kernel-minidumps"
+category = "crash-dump"
+title = "系统蓝屏小转储"
+risk = "medium"
+description = "系统蓝屏（BSOD）后生成的小型内存转储，仅用于排查蓝屏原因。没有排查需求可清理；正常不出蓝屏的系统此目录不存在。"
+min_age = "7d"
+paths = ['%SystemRoot%\Minidump']
+
+[[rule]]
 id = "thumbnail-cache"
 category = "system-residue"
 title = "缩略图/图标缓存"
 risk = "low"
+description = "资源管理器为图片/视频生成的缩略图缓存，删除后打开文件夹时会自动重建（首次浏览会稍慢）。"
 # Explorer 目录下只命中缓存文件，不清理其它数据
 paths = ['%LOCALAPPDATA%\Microsoft\Windows\Explorer']
 include = ['thumbcache_*.db', 'iconcache_*.db']
@@ -90,4 +233,5 @@ id = "crash-dumps"
 category = "crash-dump"
 title = "应用崩溃转储"
 risk = "low"
+description = "应用崩溃时的内存快照，仅用于开发者排查问题，普通用户无需保留。"
 paths = ['%LOCALAPPDATA%\CrashDumps']

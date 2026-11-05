@@ -12,7 +12,9 @@ use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
+use glob::MatchOptions;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +23,10 @@ pub use purimaster_platform::DeleteMode;
 
 /// 每条规则最多预置多少条最大文件预览（避免 IPC 载荷过大）。
 const PREVIEW_LIMIT: usize = 50;
+/// 每条规则最多保留多少条问题明细（同类权限问题可能成片出现）。
+const PROBLEM_PREVIEW: usize = 10;
+/// 单个通配路径最多展开多少个目标（防病态 glob）。
+const MAX_GLOB_TARGETS: usize = 256;
 
 // ---------------------------------------------------------------------------
 // 错误与取消
@@ -95,6 +101,18 @@ struct RuleDef {
     include: Vec<String>,
     #[serde(default)]
     exclude: Vec<String>,
+    /// 仅扫描不清理：规则目标有条件限制（如更新服务运行中）时，
+    /// 规则作者可用此属性声明"扫描展示，但清理阶段跳过"。
+    #[serde(default)]
+    scan_only: bool,
+    /// 面向用户的一句话说明：这是什么、为什么可清理（UI 详情展示）。
+    #[serde(default)]
+    description: String,
+    /// 文件年龄下限（如 "24h"、"7d"）：修改时间晚于该阈值的文件跳过不计。
+    /// 行业标准安全启发式——正在使用的临时文件几乎总是新写的
+    /// （CCleaner 对 Windows Temp 默认只清理 24 小时前的文件）。
+    #[serde(default)]
+    min_age: Option<String>,
 }
 
 /// 清理风险等级：UI 据此决定确认强度。
@@ -105,6 +123,37 @@ pub enum Risk {
     Low,
     Medium,
     High,
+}
+
+// ---------------------------------------------------------------------------
+// 进度上报（壳层负责节流，引擎逐文件回调）
+// ---------------------------------------------------------------------------
+
+/// 垃圾扫描进度快照（按规则推进，逐文件累计）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JunkScanProgress {
+    /// 当前规则下标（0 起）
+    pub rule_index: u32,
+    pub rule_count: u32,
+    /// 当前规则标题
+    pub current_title: String,
+    /// 累计已发现的文件数
+    pub files: u64,
+    /// 累计已发现的字节数
+    pub bytes: u64,
+}
+
+/// 清理进度快照（删除时重新枚举，无法预知总量，只报已完成部分）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanProgress {
+    /// 已删除（或 dry-run 下"将删除"）的文件数
+    pub deleted_files: u64,
+    pub freed_bytes: u64,
+    pub failed_count: u64,
+    /// 当前处理的规则标题
+    pub current_title: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +175,12 @@ pub struct Rule {
     pub category: String,
     pub title: String,
     pub risk: Risk,
+    /// 仅扫描：scan 阶段正常统计，clean 阶段跳过删除。
+    pub scan_only: bool,
+    /// 面向用户的一句话说明（UI 详情展示）。
+    pub description: String,
+    /// 文件年龄下限：修改时间晚于该阈值的文件在扫描与清理中一致跳过。
+    pub min_age: Option<Duration>,
     pub targets: Vec<CompiledTarget>,
     include: Option<GlobSet>,
     exclude: Option<GlobSet>,
@@ -205,14 +260,20 @@ impl RuleSet {
                 .map_err(|e| RuleError::Validation(format!("规则 `{id}` 的 include 非法：{e}")))?;
             let exclude = compile_globs(&def.exclude)
                 .map_err(|e| RuleError::Validation(format!("规则 `{id}` 的 exclude 非法：{e}")))?;
+            let min_age = match &def.min_age {
+                Some(raw) => Some(parse_min_age(raw).map_err(|e| {
+                    RuleError::Validation(format!("规则 `{id}` 的 min_age 非法：{e}"))
+                })?),
+                None => None,
+            };
 
             let targets = {
-                // 同一规则内多个路径可能展开为同一目标（如 %TEMP% == %LOCALAPPDATA%\Temp），
-                // 按大小写不敏感键去重（Windows 语义）
+                // 同一规则内多个路径可能展开为同一目标（如 %TEMP% == %LOCALAPPDATA%\Temp，
+                // 或通配符展开出的多个 Profile 目录），按大小写不敏感键去重（Windows 语义）
                 let mut seen_paths: HashSet<String> = HashSet::new();
                 def.paths
                     .iter()
-                    .map(|p| compile_target(p, protection))
+                    .flat_map(|p| compile_targets(p, protection))
                     .filter(|t| seen_paths.insert(dedup_key(&t.path)))
                     .collect()
             };
@@ -222,6 +283,9 @@ impl RuleSet {
                 category: def.category,
                 title: def.title,
                 risk: def.risk,
+                scan_only: def.scan_only,
+                description: def.description,
+                min_age,
                 targets,
                 include,
                 exclude,
@@ -258,12 +322,53 @@ impl RuleSet {
         &self.rules
     }
 
+    /// 构造"定向清理"临时规则集：用户在 UI 里指定的单个目录（可带类型过滤与年龄下限）。
+    ///
+    /// 与规则文件驱动的清理走**完全相同**的安全管线——目标在构造时过系统关键路径
+    /// 保护检查（盘符根、受保护目录当场被拒），删除阶段仍逐文件八步校验（ADR-0003）。
+    /// 规则集只存在于内存中的这一次扫描/清理，不写入任何规则文件。
+    ///
+    /// - `path`：要清理的目录（不存在的目录会通过构造，但扫描时静默为空——
+    ///   调用方应先自行校验 `is_dir` 给出友好错误）
+    /// - `include`：可选的文件名 glob 过滤（如 `["*.log"]`），空表示全部文件
+    /// - `min_age`：可选年龄下限；定向清理是用户显式指定，通常传 `None`
+    pub fn targeted(
+        path: &Path,
+        include: &[String],
+        min_age: Option<Duration>,
+        protection: &purimaster_platform::Protection,
+    ) -> Result<Self, RuleError> {
+        let include = compile_globs(include)
+            .map_err(|e| RuleError::Validation(format!("文件类型过滤非法：{e}")))?;
+        let targets = vec![compile_dir_target(path, protection)];
+        Ok(RuleSet {
+            categories: BTreeMap::from([("targeted".to_string(), "定向清理".to_string())]),
+            rules: vec![Rule {
+                id: "targeted".to_string(),
+                category: "targeted".to_string(),
+                title: "定向清理".to_string(),
+                risk: Risk::Medium,
+                scan_only: false,
+                description: format!("你指定的目录：{}", path.display()),
+                min_age,
+                targets,
+                include,
+                exclude: None,
+            }],
+        })
+    }
+
     /// 扫描所有规则目标，产出按规则分组的垃圾统计。
     ///
     /// - 目标不存在（应用未安装等）时静默跳过
     /// - 同一文件被多条规则命中时只计入**第一条**规则（按路径去重）
     /// - 每条规则最多返回 [`PREVIEW_LIMIT`] 条最大文件预览
-    pub fn scan(&self, cancel: &AtomicBool) -> Result<JunkScanResult, Cancelled> {
+    /// - `progress`：每条规则开始与每发现一个文件时回调（调用方负责节流）
+    pub fn scan(
+        &self,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(JunkScanProgress),
+    ) -> Result<JunkScanResult, Cancelled> {
         if cancel.load(Ordering::Relaxed) {
             return Err(Cancelled);
         }
@@ -273,8 +378,9 @@ impl RuleSet {
         let mut skipped: u64 = 0;
         // 跨规则去重：大小写不敏感键（Windows 语义；联接点别名属已知限制）
         let mut seen: HashSet<String> = HashSet::new();
+        let rule_count = self.rules.len() as u32;
 
-        for rule in &self.rules {
+        for (rule_index, rule) in self.rules.iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 return Err(Cancelled);
             }
@@ -282,8 +388,17 @@ impl RuleSet {
             let mut bytes: u64 = 0;
             let mut used_targets: Vec<String> = Vec::new();
             let mut problems: Vec<String> = Vec::new();
+            let mut stats = CollectStats::default();
             // 最小堆保存最大的 PREVIEW_LIMIT 条：Reverse 让堆顶为最小
             let mut top: BinaryHeap<std::cmp::Reverse<(u64, String)>> = BinaryHeap::new();
+
+            progress(JunkScanProgress {
+                rule_index: rule_index as u32,
+                rule_count,
+                current_title: rule.title.clone(),
+                files: total_files,
+                bytes: total_bytes,
+            });
 
             for target in &rule.targets {
                 if let Some(problem) = &target.problem {
@@ -311,9 +426,9 @@ impl RuleSet {
                     &target.path,
                     rule.include.as_ref(),
                     rule.exclude.as_ref(),
+                    rule.min_age,
                     cancel,
-                    &mut skipped,
-                    &mut problems,
+                    &mut stats,
                     &mut |path, size| {
                         if !seen.insert(dedup_key(&path)) {
                             return; // 已被其它规则计入
@@ -324,12 +439,30 @@ impl RuleSet {
                         if top.len() > PREVIEW_LIMIT {
                             top.pop();
                         }
+                        progress(JunkScanProgress {
+                            rule_index: rule_index as u32,
+                            rule_count,
+                            current_title: rule.title.clone(),
+                            files: total_files + files,
+                            bytes: total_bytes + bytes,
+                        });
                     },
                 )?;
             }
 
             total_files += files;
             total_bytes += bytes;
+            skipped += stats.skipped;
+            problems.append(&mut stats.problems);
+            let fresh = stats.fresh;
+
+            // 问题明细截断：同类权限问题可能成片出现（如 WER 归档子目录全部
+            // 拒绝访问），全量展示会淹没 UI——保留前若干条并给出汇总行
+            if problems.len() > PROBLEM_PREVIEW {
+                let hidden = problems.len() - PROBLEM_PREVIEW;
+                problems.truncate(PROBLEM_PREVIEW);
+                problems.push(format!("…另有 {hidden} 条同类问题未展示（多为无权限读取）"));
+            }
 
             let mut top_files: Vec<JunkFile> = top
                 .into_iter()
@@ -342,6 +475,9 @@ impl RuleSet {
                 category: rule.category.clone(),
                 title: rule.title.clone(),
                 risk: rule.risk,
+                scan_only: rule.scan_only,
+                description: rule.description.clone(),
+                fresh_files: fresh,
                 files,
                 bytes,
                 targets: used_targets,
@@ -361,15 +497,71 @@ impl RuleSet {
 }
 
 /// 编译目标：展开环境变量 + 保护检查。
-fn compile_target(raw: &str, protection: &purimaster_platform::Protection) -> CompiledTarget {
+///
+/// 含通配符（`*`/`?`）的路径按当前文件系统展开为**现存目录**（多 Profile 浏览器
+/// 缓存等场景，对齐 winapp2/CleanerML 的做法）；未安装的应用目录自然消失，
+/// 与普通目标"不存在即静默跳过"的语义一致。展开出的每个目标仍逐个过保护检查。
+fn compile_targets(raw: &str, protection: &purimaster_platform::Protection) -> Vec<CompiledTarget> {
     let expanded = expand_env(raw);
-    let path = PathBuf::from(&expanded);
+    if !expanded.contains('*') && !expanded.contains('?') {
+        return vec![compile_dir_target(Path::new(&expanded), protection)];
+    }
+    let pattern = expanded.replace('\\', "/");
+    let options = MatchOptions {
+        // Windows 路径大小写不敏感；`*` 不得跨越分隔符（防 `User Data\*` 吞掉
+        // 更深层结构），`.` 开头的目录也参与匹配
+        case_sensitive: false,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    };
+    match glob::glob_with(&pattern, options) {
+        Ok(paths) => paths
+            .filter_map(|p| p.ok())
+            .filter(|p| p.is_dir())
+            .take(MAX_GLOB_TARGETS)
+            .map(|p| compile_dir_target(&p, protection))
+            .collect(),
+        Err(e) => vec![CompiledTarget {
+            path: PathBuf::from(&expanded),
+            problem: Some(format!("通配路径无法解析（{e}）")),
+        }],
+    }
+}
+
+fn compile_dir_target(path: &Path, protection: &purimaster_platform::Protection) -> CompiledTarget {
     let problem = if !path.is_absolute() {
         Some("路径含未展开的环境变量或不是绝对路径".to_string())
     } else {
-        purimaster_platform::check_target_against(&path, protection).err()
+        purimaster_platform::check_target_against(path, protection).err()
     };
-    CompiledTarget { path, problem }
+    CompiledTarget {
+        path: path.to_path_buf(),
+        problem,
+    }
+}
+
+/// 解析 `min_age` 字段：`<数字><单位>`，单位 h（小时）/ d（天）/ w（周）。
+fn parse_min_age(raw: &str) -> Result<Duration, String> {
+    let raw = raw.trim();
+    let invalid = || format!("`{raw}`（应为如 \"24h\"、\"7d\"、\"2w\" 的时长）");
+    if raw.len() < 2 {
+        return Err(invalid());
+    }
+    let (digits, unit) = raw.split_at(raw.len() - 1);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let n: u64 = digits.parse().map_err(|_| invalid())?;
+    if n == 0 {
+        return Err(invalid());
+    }
+    let seconds = match unit {
+        "h" => n.checked_mul(3600),
+        "d" => n.checked_mul(86400),
+        "w" => n.checked_mul(7 * 86400),
+        _ => return Err(invalid()),
+    };
+    seconds.map(Duration::from_secs).ok_or_else(invalid)
 }
 
 /// 编译 glob 列表；空列表返回 None（表示不参与过滤）。
@@ -432,14 +624,26 @@ fn dedup_key(path: &Path) -> String {
     s
 }
 
+/// collect_files 的旁路统计（跳过/近期/问题明细），收拢为一避免参数爆炸。
+#[derive(Default)]
+struct CollectStats {
+    skipped: u64,
+    fresh: u64,
+    problems: Vec<String>,
+}
+
 /// 递归收集目录下的文件（迭代式，无递归栈风险）。
+///
+/// `min_age`：文件年龄下限（BleachBit `age` 属性 / CCleaner "只清理 24 小时前的
+/// Temp 文件" 同款启发式）。修改时间晚于截止点、或时间戳在未来的文件跳过并计入
+/// `stats.fresh`——正在使用的临时/缓存文件几乎总是新写的。
 fn collect_files(
     root: &Path,
     include: Option<&GlobSet>,
     exclude: Option<&GlobSet>,
+    min_age: Option<Duration>,
     cancel: &AtomicBool,
-    skipped: &mut u64,
-    problems: &mut Vec<String>,
+    stats: &mut CollectStats,
     on_file: &mut dyn FnMut(PathBuf, u64),
 ) -> Result<(), Cancelled> {
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
@@ -451,8 +655,10 @@ fn collect_files(
             Ok(e) => e,
             Err(e) => {
                 // 目录存在但读不了（如 %SystemRoot%\Temp 对标准用户）：必须让用户看见
-                problems.push(format!("{}：无法读取目录（{e}）", dir.display()));
-                *skipped += 1;
+                stats
+                    .problems
+                    .push(format!("{}：无法读取目录（{e}）", dir.display()));
+                stats.skipped += 1;
                 continue;
             }
         };
@@ -461,11 +667,11 @@ fn collect_files(
                 return Err(Cancelled);
             }
             let Ok(entry) = entry else {
-                *skipped += 1;
+                stats.skipped += 1;
                 continue;
             };
             let Ok(ft) = entry.file_type() else {
-                *skipped += 1;
+                stats.skipped += 1;
                 continue;
             };
             let path = entry.path();
@@ -483,7 +689,7 @@ fn collect_files(
                     .collect::<Vec<_>>()
                     .join("/"),
                 Err(_) => {
-                    *skipped += 1;
+                    stats.skipped += 1;
                     continue;
                 }
             };
@@ -494,9 +700,20 @@ fn collect_files(
                 continue;
             }
             let Ok(meta) = entry.metadata() else {
-                *skipped += 1;
+                stats.skipped += 1;
                 continue;
             };
+            if let Some(min_age) = min_age {
+                let is_fresh = match meta.modified() {
+                    // 修改时间晚于截止点 → 近期文件；elapsed 出错（未来时间戳）同判
+                    Ok(m) => m.elapsed().map(|age| age < min_age).unwrap_or(true),
+                    Err(_) => true,
+                };
+                if is_fresh {
+                    stats.fresh += 1;
+                    continue;
+                }
+            }
             on_file(path, meta.len());
         }
     }
@@ -555,11 +772,13 @@ impl RuleSet {
     /// - 归属计算与 `scan` 一致：按规则顺序全局去重，保证实际删除量不超过确认弹窗的统计
     /// - 单个文件失败不中断，计入 `failed`
     /// - 取消会提前结束，已完成的部分保留在报告中（`cancelled = true`）
+    /// - `progress`：每条选中规则开始与每个文件处理完后回调（调用方负责节流）
     pub fn clean(
         &self,
         rule_ids: &[String],
         cancel: &AtomicBool,
         options: CleanOptions,
+        progress: &mut dyn FnMut(CleanProgress),
     ) -> CleanReport {
         let mut report = CleanReport {
             dry_run: options.dry_run,
@@ -592,6 +811,22 @@ impl RuleSet {
 
         'rules: for rule in &self.rules {
             let is_selected = selected.contains(rule.id.as_str());
+            if is_selected {
+                progress(CleanProgress {
+                    deleted_files: report.deleted_files,
+                    freed_bytes: report.freed_bytes,
+                    failed_count: report.failed_count,
+                    current_title: rule.title.clone(),
+                });
+                if rule.scan_only {
+                    report.skipped_rules.push(format!(
+                        "{}：规则配置为仅扫描（scan_only），本轮未清理",
+                        rule.id
+                    ));
+                }
+            }
+            let title = rule.title.clone();
+            let may_delete = is_selected && !rule.scan_only;
             for target in &rule.targets {
                 if cancel.load(Ordering::Relaxed) {
                     report.cancelled = true;
@@ -642,21 +877,20 @@ impl RuleSet {
                     continue;
                 }
 
-                let mut skipped = 0u64;
-                let mut problems: Vec<String> = Vec::new();
+                let mut stats = CollectStats::default();
                 let walk = collect_files(
                     &target.path,
                     rule.include.as_ref(),
                     rule.exclude.as_ref(),
+                    rule.min_age,
                     cancel,
-                    &mut skipped,
-                    &mut problems,
+                    &mut stats,
                     &mut |path, _size| {
                         if !seen.insert(dedup_key(&path)) {
                             return;
                         }
-                        // 未选中的规则只参与归属计算，不执行删除
-                        if !is_selected {
+                        // 未选中的规则与 scan_only 规则只参与归属计算，不执行删除
+                        if !may_delete {
                             return;
                         }
                         match purimaster_platform::delete_file(
@@ -679,12 +913,18 @@ impl RuleSet {
                                 }
                             }
                         }
+                        progress(CleanProgress {
+                            deleted_files: report.deleted_files,
+                            freed_bytes: report.freed_bytes,
+                            failed_count: report.failed_count,
+                            current_title: title.clone(),
+                        });
                     },
                 );
                 // 无论是否取消都回写跳过/问题信息，避免报告丢失现场
                 if is_selected {
-                    report.skipped += skipped;
-                    for p in problems {
+                    report.skipped += stats.skipped;
+                    for p in stats.problems {
                         report.skipped_rules.push(format!("{}：{p}", rule.id));
                     }
                 }
@@ -713,6 +953,13 @@ pub struct JunkGroup {
     pub category: String,
     pub title: String,
     pub risk: Risk,
+    /// 仅扫描：清理阶段会跳过该规则
+    pub scan_only: bool,
+    /// 面向用户的一句话说明（可能为空）
+    pub description: String,
+    /// 因年龄策略（min_age）跳过的近期文件数——检测透明化：
+    /// 用户应知道"这些文件没算进来"以及原因
+    pub fresh_files: u64,
     pub files: u64,
     pub bytes: u64,
     /// 实际存在并已扫描的目标目录
@@ -770,7 +1017,7 @@ paths = [{paths}]
     }
 
     fn scan_with(set: &RuleSet) -> JunkScanResult {
-        set.scan(&AtomicBool::new(false)).unwrap()
+        set.scan(&AtomicBool::new(false), &mut |_| {}).unwrap()
     }
 
     #[test]
@@ -1024,7 +1271,7 @@ paths = ["C:\\x"]
 "#;
         let set = RuleSet::from_toml_strs_with_protection(&[toml], &Protection::default()).unwrap();
         let cancel = AtomicBool::new(true);
-        assert!(set.scan(&cancel).is_err());
+        assert!(set.scan(&cancel, &mut |_| {}).is_err());
     }
 
     #[test]
@@ -1187,6 +1434,7 @@ include_paths = ["typo"]
             &["test-rule".to_string()],
             &AtomicBool::new(false),
             clean_opts(purimaster_platform::DeleteMode::Permanent, true),
+            &mut |_| {},
         );
         assert!(report.dry_run);
         assert_eq!(report.deleted_files, 2);
@@ -1207,6 +1455,7 @@ include_paths = ["typo"]
             &["test-rule".to_string()],
             &AtomicBool::new(false),
             clean_opts(purimaster_platform::DeleteMode::Permanent, false),
+            &mut |_| {},
         );
         assert_eq!(report.deleted_files, 2);
         assert_eq!(report.freed_bytes, 30);
@@ -1221,6 +1470,7 @@ include_paths = ["typo"]
             &["nope".to_string()],
             &AtomicBool::new(false),
             clean_opts(purimaster_platform::DeleteMode::Trash, true),
+            &mut |_| {},
         );
         assert_eq!(report.deleted_files, 0);
         assert!(
@@ -1241,6 +1491,7 @@ include_paths = ["typo"]
             &["test-rule".to_string()],
             &AtomicBool::new(true),
             clean_opts(purimaster_platform::DeleteMode::Permanent, false),
+            &mut |_| {},
         );
         assert!(report.cancelled);
         assert_eq!(report.deleted_files, 0);
@@ -1268,6 +1519,7 @@ include_paths = ["typo"]
             &["test-rule".to_string()],
             &AtomicBool::new(false),
             clean_opts(purimaster_platform::DeleteMode::Permanent, false),
+            &mut |_| {},
         );
         // 正常文件被删除，被占用文件失败但不中断整批
         assert_eq!(report.deleted_files, 1);
@@ -1299,6 +1551,7 @@ paths = ['%SystemRoot%\System32']
             &["evil".to_string()],
             &AtomicBool::new(false),
             clean_opts(purimaster_platform::DeleteMode::Permanent, true),
+            &mut |_| {},
         );
         assert_eq!(report.deleted_files, 0);
         assert!(
@@ -1349,6 +1602,7 @@ paths = [{p}]
             &["rest".to_string()],
             &AtomicBool::new(false),
             clean_opts(purimaster_platform::DeleteMode::Permanent, false),
+            &mut |_| {},
         );
         assert_eq!(report.deleted_files, 1);
         assert!(junk.join("a.log").exists());
@@ -1378,6 +1632,7 @@ paths = ["C:\\__purimaster_no_such_b__"]
             &["r1".to_string(), "r2".to_string()],
             &AtomicBool::new(true),
             clean_opts(purimaster_platform::DeleteMode::Trash, true),
+            &mut |_| {},
         );
         assert!(report.cancelled);
         assert!(
@@ -1402,6 +1657,7 @@ paths = ["C:\\__purimaster_no_such_b__"]
             &["test-rule".to_string()],
             &AtomicBool::new(false),
             clean_opts(purimaster_platform::DeleteMode::Permanent, true),
+            &mut |_| {},
         );
         assert_eq!(report.deleted_files, 0);
         assert_eq!(report.skipped, 1);
@@ -1412,6 +1668,455 @@ paths = ["C:\\__purimaster_no_such_b__"]
                 .any(|s| s.contains("目标不是目录")),
             "实际：{:?}",
             report.skipped_rules
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 进度回调测试（P0：清理/扫描进度事件）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scan_progress_reports_rule_boundary_and_final_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("junk");
+        fs::create_dir(&junk).unwrap();
+        fs::write(junk.join("a.bin"), [0u8; 10]).unwrap();
+        fs::write(junk.join("b.bin"), [0u8; 20]).unwrap();
+
+        let toml = rule_toml(&tomldir(&junk), None, None);
+        let set =
+            RuleSet::from_toml_strs_with_protection(&[&toml], &Protection::default()).unwrap();
+
+        let mut calls = Vec::new();
+        set.scan(&AtomicBool::new(false), &mut |p| calls.push(p))
+            .unwrap();
+        // 首条：规则开始，尚未发现文件
+        assert_eq!(calls[0].rule_index, 0);
+        assert_eq!(calls[0].rule_count, 1);
+        assert_eq!(calls[0].current_title, "测试规则");
+        assert_eq!(calls[0].files, 0);
+        // 末条：累计到最终计数
+        let last = calls.last().unwrap();
+        assert_eq!(last.files, 2);
+        assert_eq!(last.bytes, 30);
+    }
+
+    #[test]
+    fn clean_progress_reports_running_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (set, junk) = junk_set(dir.path());
+        fs::write(junk.join("a.bin"), [0u8; 10]).unwrap();
+        fs::write(junk.join("b.bin"), [0u8; 20]).unwrap();
+
+        let mut calls = Vec::new();
+        set.clean(
+            &["test-rule".to_string()],
+            &AtomicBool::new(false),
+            clean_opts(purimaster_platform::DeleteMode::Permanent, false),
+            &mut |p| calls.push(p),
+        );
+        // 首条：规则开始（0 删除），末条：全部完成
+        assert_eq!(calls[0].deleted_files, 0);
+        assert_eq!(calls[0].current_title, "测试规则");
+        let last = calls.last().unwrap();
+        assert_eq!(last.deleted_files, 2);
+        assert_eq!(last.freed_bytes, 30);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clean_progress_reports_failures_too() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (set, junk) = junk_set(dir.path());
+        // 与 clean_failure_does_not_abort_batch 相同手法：独占句柄制造共享冲突
+        let locked = junk.join("locked.bin");
+        fs::write(&locked, [0u8; 5]).unwrap();
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&locked)
+            .unwrap();
+
+        let mut failed_seen = 0u64;
+        set.clean(
+            &["test-rule".to_string()],
+            &AtomicBool::new(false),
+            clean_opts(purimaster_platform::DeleteMode::Permanent, false),
+            &mut |p| failed_seen = failed_seen.max(p.failed_count),
+        );
+        assert_eq!(failed_seen, 1, "失败计数应通过进度可见");
+        drop(handle);
+    }
+
+    // -----------------------------------------------------------------------
+    // scan_only 与 serde 契约测试（模拟用户测试 F-11 / F-41）
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // 筛选算法：min_age 文件年龄与通配目标展开（对标 CleanerML/winapp2）
+    // -----------------------------------------------------------------------
+
+    /// 把文件修改时间设为 now - age_secs（测试夹具：SetFileTime，仅 Windows；
+    /// 非 Windows 平台 no-op——min_age 逻辑本身有独立于平台的单测覆盖）
+    #[cfg(windows)]
+    fn set_mtime(path: &Path, age_secs: u64) {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::{FILETIME, HANDLE};
+        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, SetFileTime};
+
+        // FILETIME = 100ns 自 1601-01-01；UNIX epoch 差 11,644,473,600 秒
+        let target = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - age_secs;
+        let ft100ns = (target + 11_644_473_600) * 10_000_000;
+        let ft = FILETIME {
+            dwLowDateTime: (ft100ns & 0xFFFF_FFFF) as u32,
+            dwHighDateTime: (ft100ns >> 32) as u32,
+        };
+        // 改 mtime 需要 FILE_WRITE_ATTRIBUTES 访问权：custom_access_mask + 该位，
+        // 只读打开会静默失败（SetFileTime 返回假成功之外的静默丢弃）
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0001_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        let file = std::fs::OpenOptions::new()
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .access_mode(GENERIC_WRITE | FILE_WRITE_ATTRIBUTES)
+            .open(path)
+            .unwrap();
+        let handle = std::os::windows::io::AsRawHandle::as_raw_handle(&file) as HANDLE;
+        unsafe {
+            let ok = SetFileTime(handle, std::ptr::null(), std::ptr::null(), &ft);
+            if ok == 0 {
+                panic!(
+                    "SetFileTime 失败（GetLastError={}）",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn set_mtime(_path: &Path, _age_secs: u64) {}
+
+    #[test]
+    fn parse_min_age_units() {
+        assert_eq!(parse_min_age("24h"), Ok(Duration::from_secs(86400)));
+        assert_eq!(parse_min_age("7d"), Ok(Duration::from_secs(7 * 86400)));
+        assert_eq!(parse_min_age("2w"), Ok(Duration::from_secs(14 * 86400)));
+        // 非法输入
+        assert!(parse_min_age("24").is_err());
+        assert!(parse_min_age("h").is_err());
+        assert!(parse_min_age("0d").is_err());
+        assert!(parse_min_age("24x").is_err());
+        assert!(parse_min_age("-1d").is_err());
+    }
+
+    #[test]
+    fn min_age_skips_recent_files_and_reports_fresh_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("junk");
+        fs::create_dir(&junk).unwrap();
+        let fresh_file = junk.join("fresh.bin");
+        let old_file = junk.join("old.bin");
+        fs::write(&fresh_file, [0u8; 10]).unwrap();
+        fs::write(&old_file, [0u8; 20]).unwrap();
+        set_mtime(&fresh_file, 60); // 1 分钟前
+        set_mtime(&old_file, 3 * 86400); // 3 天前
+        // 夹具自检：backdate 必须真实生效，否则后续断言无意义
+        let age = old_file
+            .metadata()
+            .unwrap()
+            .modified()
+            .unwrap()
+            .elapsed()
+            .unwrap();
+        assert!(
+            age > Duration::from_secs(86400),
+            "测试夹具未能回拨 mtime（实际年龄 {age:?}），SetFileTime 失败"
+        );
+
+        let toml = format!(
+            r#"
+[categories]
+temp = "临时文件"
+
+[[rule]]
+id = "test-rule"
+category = "temp"
+title = "测试规则"
+min_age = "24h"
+paths = [{paths}]
+"#,
+            paths = tomldir(&junk)
+        );
+        let set =
+            RuleSet::from_toml_strs_with_protection(&[&toml], &Protection::default()).unwrap();
+
+        let result = scan_with(&set);
+        let group = &result.groups[0];
+        // 只统计老文件
+        assert_eq!(group.files, 1);
+        assert_eq!(group.bytes, 20);
+        assert_eq!(group.fresh_files, 1, "近期文件应单独计数展示");
+        assert!(group.top_files[0].path.ends_with("old.bin"));
+
+        // 清理一致：只有老文件被删
+        let report = set.clean(
+            &["test-rule".to_string()],
+            &AtomicBool::new(false),
+            clean_opts(purimaster_platform::DeleteMode::Permanent, false),
+            &mut |_| {},
+        );
+        assert_eq!(report.deleted_files, 1);
+        assert!(fresh_file.exists(), "近期文件不得被清理");
+        assert!(!old_file.exists());
+    }
+
+    #[test]
+    fn glob_paths_expand_to_existing_directories() {
+        let base = tempfile::tempdir().unwrap();
+        // 模拟多 Profile：profile-a / profile-b 存在，profile-c 目录不测（不创建）
+        let pa = base.path().join("User Data").join("Profile A");
+        let pb = base.path().join("User Data").join("Profile B");
+        fs::create_dir_all(pa.join("Cache")).unwrap();
+        fs::create_dir_all(pb.join("Cache")).unwrap();
+        fs::write(pa.join("Cache").join("a.bin"), [0u8; 10]).unwrap();
+        fs::write(pb.join("Cache").join("b.bin"), [0u8; 20]).unwrap();
+
+        // 目录名带空格：toml 字面量串安全；glob 模式展开 Profile 目录
+        let pattern = base.path().join("User Data").join("*").join("Cache");
+        let toml = format!(
+            r#"
+[categories]
+browser = "浏览器缓存"
+
+[[rule]]
+id = "profiles"
+category = "browser"
+title = "多 Profile 缓存"
+paths = ['{pattern}']
+"#,
+            pattern = pattern.display()
+        );
+        let set =
+            RuleSet::from_toml_strs_with_protection(&[&toml], &Protection::default()).unwrap();
+
+        let rule = &set.rules()[0];
+        assert_eq!(
+            rule.targets.len(),
+            2,
+            "应展开为两个现存 Profile 的 Cache 目录"
+        );
+
+        let result = scan_with(&set);
+        assert_eq!(result.total_files, 2);
+        assert_eq!(result.total_bytes, 30);
+    }
+
+    #[test]
+    fn description_survives_to_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("junk");
+        fs::create_dir(&junk).unwrap();
+        let toml = format!(
+            r#"
+[categories]
+temp = "临时文件"
+
+[[rule]]
+id = "test-rule"
+category = "temp"
+title = "测试规则"
+description = "这是一段给用户看的说明"
+paths = [{paths}]
+"#,
+            paths = tomldir(&junk)
+        );
+        let set =
+            RuleSet::from_toml_strs_with_protection(&[&toml], &Protection::default()).unwrap();
+        let result = scan_with(&set);
+        assert_eq!(result.groups[0].description, "这是一段给用户看的说明");
+    }
+
+    // -----------------------------------------------------------------------
+    // 定向清理（用户指定目录的临时规则集）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn targeted_ruleset_scans_and_cleans_user_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.log"), [0u8; 10]).unwrap();
+        fs::write(dir.path().join("b.tmp"), [0u8; 20]).unwrap();
+
+        // 全部文件
+        let set = RuleSet::targeted(dir.path(), &[], None, &Protection::default()).unwrap();
+        let result = scan_with(&set);
+        assert_eq!(result.total_files, 2);
+        assert_eq!(result.groups[0].title, "定向清理");
+        assert!(result.groups[0].description.contains("你指定的目录"));
+
+        // 清理走同一管线
+        let report = set.clean(
+            &["targeted".to_string()],
+            &AtomicBool::new(false),
+            clean_opts(purimaster_platform::DeleteMode::Permanent, false),
+            &mut |_| {},
+        );
+        assert_eq!(report.deleted_files, 2);
+        assert!(!dir.path().join("a.log").exists());
+    }
+
+    #[test]
+    fn targeted_ruleset_respects_include_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.log"), [0u8; 10]).unwrap();
+        fs::write(dir.path().join("b.tmp"), [0u8; 20]).unwrap();
+
+        let set = RuleSet::targeted(
+            dir.path(),
+            &["*.log".to_string()],
+            None,
+            &Protection::default(),
+        )
+        .unwrap();
+        let result = scan_with(&set);
+        assert_eq!(result.total_files, 1);
+        assert!(result.groups[0].top_files[0].path.ends_with("a.log"));
+    }
+
+    #[test]
+    fn targeted_ruleset_rejects_protected_target() {
+        // 保护检查在构造时执行：sensitive 目录的目标直接带 problem，扫描为空
+        let dir = tempfile::tempdir().unwrap();
+        let sensitive = dir.path().join("sensitive");
+        fs::create_dir(&sensitive).unwrap();
+        fs::write(sensitive.join("x.bin"), [0u8; 5]).unwrap();
+        let protection = Protection {
+            sensitive: vec![sensitive.clone()],
+            ancestor_only: vec![],
+        };
+
+        let set = RuleSet::targeted(&sensitive, &[], None, &protection).unwrap();
+        assert!(
+            set.rules()[0].targets[0].problem.is_some(),
+            "受保护目标应在构造期被标记"
+        );
+        let result = scan_with(&set);
+        assert_eq!(result.total_files, 0);
+        assert!(!result.groups[0].problems.is_empty(), "问题应可见");
+    }
+
+    #[test]
+    fn targeted_ruleset_bad_glob_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = RuleSet::targeted(dir.path(), &["[".to_string()], None, &Protection::default())
+            .unwrap_err();
+        assert!(err.to_string().contains("文件类型过滤非法"), "实际：{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // scan_only 与 serde 契约测试（模拟用户测试 F-11 / F-41，原位置）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scan_only_rule_is_scanned_but_never_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("junk");
+        fs::create_dir(&junk).unwrap();
+        fs::write(junk.join("a.bin"), [0u8; 10]).unwrap();
+
+        let toml = format!(
+            r#"
+[categories]
+temp = "临时文件"
+
+[[rule]]
+id = "test-rule"
+category = "temp"
+title = "测试规则"
+scan_only = true
+paths = [{paths}]
+"#,
+            paths = tomldir(&junk)
+        );
+        let set =
+            RuleSet::from_toml_strs_with_protection(&[&toml], &Protection::default()).unwrap();
+
+        // 扫描正常统计
+        let result = scan_with(&set);
+        assert_eq!(result.total_files, 1);
+        assert!(result.groups[0].scan_only);
+
+        // 清理跳过：文件保留，报告说明原因
+        let report = set.clean(
+            &["test-rule".to_string()],
+            &AtomicBool::new(false),
+            clean_opts(purimaster_platform::DeleteMode::Permanent, false),
+            &mut |_| {},
+        );
+        assert_eq!(report.deleted_files, 0);
+        assert!(junk.join("a.bin").exists(), "scan_only 规则不得删除文件");
+        assert!(
+            report.skipped_rules.iter().any(|s| s.contains("仅扫描")),
+            "实际：{:?}",
+            report.skipped_rules
+        );
+    }
+
+    #[test]
+    fn progress_and_report_serde_fields_are_camel_case() {
+        // IPC 契约快照：字段名漂移会让前端拿到 undefined（模拟用户测试 F-41 建议）
+        let scan = serde_json::to_value(JunkScanProgress {
+            rule_index: 0,
+            rule_count: 8,
+            current_title: "t".into(),
+            files: 1,
+            bytes: 2,
+        })
+        .unwrap();
+        assert_eq!(
+            scan,
+            serde_json::json!({
+                "ruleIndex": 0, "ruleCount": 8, "currentTitle": "t", "files": 1, "bytes": 2
+            })
+        );
+
+        let clean = serde_json::to_value(CleanProgress {
+            deleted_files: 1,
+            freed_bytes: 2,
+            failed_count: 3,
+            current_title: "t".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            clean,
+            serde_json::json!({
+                "deletedFiles": 1, "freedBytes": 2, "failedCount": 3, "currentTitle": "t"
+            })
+        );
+
+        let report = serde_json::to_value(CleanReport {
+            dry_run: true,
+            mode: "trash",
+            deleted_files: 0,
+            freed_bytes: 0,
+            failed_count: 0,
+            failed: vec![],
+            skipped: 0,
+            skipped_rules: vec![],
+            cancelled: false,
+        })
+        .unwrap();
+        assert_eq!(
+            report,
+            serde_json::json!({
+                "dryRun": true, "mode": "trash", "deletedFiles": 0, "freedBytes": 0,
+                "failedCount": 0, "failed": [], "skipped": 0, "skippedRules": [],
+                "cancelled": false
+            })
         );
     }
 }

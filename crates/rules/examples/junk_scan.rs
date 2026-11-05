@@ -30,13 +30,22 @@ fn main() {
         set.categories().len()
     );
 
-    let result = match set.scan(&AtomicBool::new(false)) {
+    let result = match set.scan(&AtomicBool::new(false), &mut |p| {
+        eprint!(
+            "\r[{:>2}/{}] {} · {} 文件  ",
+            p.rule_index + 1,
+            p.rule_count,
+            p.current_title,
+            p.files
+        );
+    }) {
         Ok(r) => r,
         Err(_) => {
             eprintln!("扫描被取消");
             return;
         }
     };
+    eprintln!();
 
     println!(
         "\n合计：{} 个文件，{:.2} MB，跳过 {} 项\n",
