@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use purimaster_core::{FileListing, NodeSummary, ScanError, ScanIndex, ScanProgress, scan_space};
-use purimaster_rules::{CleanOptions, CleanReport, DeleteMode, JunkScanResult, RuleSet};
+use purimaster_rules::{
+    CleanFileFailure, CleanOptions, CleanReport, DeleteMode, JunkScanResult, RuleSet,
+};
 use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -25,6 +27,10 @@ type LatestIndex = Arc<Mutex<Option<(String, Arc<ScanIndex>)>>>;
 /// 清理规则集（启动时加载；加载失败时记录错误）
 type Rules = Arc<Mutex<Option<Arc<RuleSet>>>>;
 
+/// 关窗武装窗口：首次阻止后的该时长内重复关窗直接忽略，
+/// 防止性急双击 X 在读到确认框前就放行退出、中断不可回滚的删除批次。
+const CLOSE_ARMING: Duration = Duration::from_millis(1500);
+
 /// 应用状态：进行中的取消标志 + 最近一次扫描索引 + 清理规则。
 /// 字段用 `Arc` 包装，便于把句柄克隆进工作线程（`State` 本身只是借用）。
 #[derive(Default)]
@@ -33,12 +39,51 @@ struct AppState {
     latest: LatestIndex,
     rules: Rules,
     rules_error: Arc<Mutex<Option<String>>>,
+    /// 当前活跃的空间扫描 clientId（单飞：新的空间扫描会取消旧的，避免并发堆积）
+    space_active: Arc<Mutex<Option<String>>>,
     /// 当前活跃的垃圾扫描 clientId（单飞：新的垃圾扫描会取消旧的，避免并发堆积）
     junk_active: Arc<Mutex<Option<String>>>,
+    /// 当前活跃的清理 clientId（删除不可中断：新清理请求被拒绝而非取消旧任务）
+    clean_active: Arc<Mutex<Option<String>>>,
+    /// 当前活跃的定向扫描 clientId（仅与定向扫描自身互斥，读操作不与清理互斥）
+    targeted_active: Arc<Mutex<Option<String>>>,
     /// 最近一次完成的垃圾扫描结果：切页不取消扫描，重新进入页面时取回展示
     junk_cache: Arc<Mutex<Option<JunkScanResult>>>,
     /// 最近一次清理报告：清理期间切换页签后，重新进入页面可取回（逐文件结果不丢失）
     last_clean: Arc<Mutex<Option<CleanReport>>>,
+    /// 关窗保护状态：Some(首次阻止时刻)。任务表清空时复位。
+    close_denied_at: Arc<Mutex<Option<Instant>>>,
+}
+
+/// 任务表清空时复位关窗保护，避免残留标志让下一次关窗跳过确认直接退出。
+fn reset_close_guard_if_idle(tasks: &TaskMap, guard: &Arc<Mutex<Option<Instant>>>) {
+    if tasks.lock().unwrap().is_empty() {
+        *guard.lock().unwrap() = None;
+    }
+}
+
+/// 扫描与定向清理共用的根路径归一化：裸盘符 `C:` 归一为 `C:\`，
+/// 盘符相对路径 `C:foo` 直接拒绝——Win32 语义下它们按"该盘当前目录"解析，
+/// 会静默指错目标（模拟用户测试 F-23）。
+fn normalize_scan_root(raw: &str) -> Result<std::path::PathBuf, String> {
+    let trimmed = raw.trim();
+    let mut path = std::path::PathBuf::from(trimmed);
+    {
+        use std::path::Component;
+        let mut comps = path.components();
+        match (comps.next(), comps.next()) {
+            (Some(Component::Prefix(_)), None) => {
+                path.push(std::path::MAIN_SEPARATOR_STR);
+            }
+            (Some(Component::Prefix(_)), Some(_)) if !path.has_root() => {
+                return Err(format!(
+                    "盘符相对路径「{trimmed}」会按当前目录解析，请输入完整路径（如 {trimmed}\\ 或 C:\\Users）"
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(path)
 }
 
 /// 统一的事件发送：失败必须可见（stderr），不允许静默吞掉。
@@ -58,9 +103,12 @@ fn ipc_hello(app: AppHandle) {
 ///
 /// 事件（均带 `clientId`）：
 /// - `scan://progress` `{ filesSeen, bytesSeen }`
-/// - `scan://complete` `{ filesSeen, bytesSeen, skipped, root, rootChildren }`
+/// - `scan://complete` `{ filesSeen, bytesSeen, skipped, junctions, root, rootChildren }`
 /// - `scan://cancelled`
 /// - `scan://failed` `{ message }`
+///
+/// 根路径归一化：裸盘符 `C:` 归一化为 `C:\`；盘符相对路径 `C:foo` 直接拒绝
+/// （Win32 语义下它们按"该盘当前目录"解析，会静默扫错目录——模拟用户测试 F-23）。
 #[tauri::command]
 fn start_scan(
     app: AppHandle,
@@ -71,20 +119,32 @@ fn start_scan(
     if client_id.is_empty() || client_id.len() > 128 {
         return Err("非法的 clientId".into());
     }
-    let path = std::path::PathBuf::from(&root);
+    let path = normalize_scan_root(&root)?;
     if !path.is_dir() {
-        return Err(format!("目录不存在：{root}"));
+        return Err(format!("目录不存在：{}", root.trim()));
     }
 
     let cancel = Arc::new(AtomicBool::new(false));
     let tasks = state.tasks.clone();
     let latest = state.latest.clone();
+    let space_active = state.space_active.clone();
+    let close_guard = state.close_denied_at.clone();
+    // 单飞：新的空间扫描自动取消仍在运行的旧扫描（与垃圾扫描同策略）
+    {
+        let mut active = space_active.lock().unwrap();
+        if let Some(prev) = active.as_ref()
+            && let Some(flag) = tasks.lock().unwrap().get(prev)
+        {
+            flag.store(true, Ordering::Relaxed);
+        }
+        *active = Some(client_id.clone());
+    }
     tasks
         .lock()
         .unwrap()
         .insert(client_id.clone(), cancel.clone());
 
-    eprintln!("[purimaster] 扫描任务 {client_id} 启动: {root}");
+    eprintln!("[purimaster] 扫描任务 {client_id} 启动: {}", path.display());
     std::thread::spawn(move || {
         let mut last_emit = Instant::now() - Duration::from_secs(1);
         let mut progress = |p: ScanProgress| {
@@ -108,10 +168,11 @@ fn start_scan(
                 let files_seen = index.files_seen;
                 let bytes_seen = index.bytes_seen;
                 let skipped = index.skipped;
+                let junctions = index.junctions;
                 let root_summary = index.summary(index.root_id()).unwrap();
                 let root_children = index.children(index.root_id());
                 eprintln!(
-                    "[purimaster] 扫描任务 {client_id} 完成: {files_seen} files, {} dirs, {skipped} skipped",
+                    "[purimaster] 扫描任务 {client_id} 完成: {files_seen} files, {} dirs, {skipped} skipped, {junctions} junctions",
                     root_summary.dirs
                 );
                 *latest.lock().unwrap() = Some((client_id.clone(), Arc::new(index)));
@@ -123,6 +184,7 @@ fn start_scan(
                         "filesSeen": files_seen,
                         "bytesSeen": bytes_seen,
                         "skipped": skipped,
+                        "junctions": junctions,
                         "root": root_summary,
                         "rootChildren": root_children,
                     }),
@@ -147,20 +209,37 @@ fn start_scan(
         }
 
         tasks.lock().unwrap().remove(&client_id);
+        {
+            let mut active = space_active.lock().unwrap();
+            if active.as_deref() == Some(client_id.as_str()) {
+                *active = None;
+            }
+        }
+        reset_close_guard_if_idle(&tasks, &close_guard);
     });
 
     Ok(())
 }
 
 /// 请求取消一次扫描。实际中止是异步的，以 `scan://cancelled` 事件为准。
+///
+/// 对不存在的 clientId 返回错误（而非静默成功）：任务可能已结束，
+/// 让前端能感知"这次点击没有取消任何东西"，而不是按钮看似无响应。
 #[tauri::command]
-fn cancel_scan(state: State<'_, AppState>, client_id: String) {
-    if let Some(flag) = state.tasks.lock().unwrap().get(&client_id) {
-        flag.store(true, Ordering::Relaxed);
+fn cancel_scan(state: State<'_, AppState>, client_id: String) -> Result<(), String> {
+    match state.tasks.lock().unwrap().get(&client_id) {
+        Some(flag) => {
+            flag.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+        None => Err("没有可取消的任务（可能已结束）".into()),
     }
 }
 
 /// 按需拉取某节点的直接子目录（按大小降序）。
+///
+/// clientId 不匹配的报错在当前 UI 流程下不可达（索引替换与 complete 事件同序，
+/// 前端先清空旧树再收新树）——保留为纯防御，避免未来多索引/多窗口时静默错配。
 #[tauri::command]
 fn dir_children(
     state: State<'_, AppState>,
@@ -177,6 +256,7 @@ fn dir_children(
 /// 启动一次垃圾扫描（只读）。
 ///
 /// 事件（均带 `clientId`）：
+/// - `junk://progress` `{ ruleIndex, ruleCount, currentTitle, files, bytes }`
 /// - `junk://complete` `{ result: JunkScanResult }`
 /// - `junk://cancelled`
 ///
@@ -219,8 +299,28 @@ fn scan_junk(app: AppHandle, state: State<'_, AppState>, client_id: String) -> R
 
     eprintln!("[purimaster] 垃圾扫描 {client_id} 启动");
     let junk_cache = state.junk_cache.clone();
+    let close_guard = state.close_denied_at.clone();
     std::thread::spawn(move || {
-        match rules.scan(&cancel) {
+        // 进度节流：与空间扫描一致，最多 ~6.6 次/秒
+        let mut last_emit = Instant::now() - Duration::from_secs(1);
+        let mut progress = |p: purimaster_rules::JunkScanProgress| {
+            if last_emit.elapsed() >= Duration::from_millis(150) {
+                last_emit = Instant::now();
+                emit(
+                    &app,
+                    "junk://progress",
+                    serde_json::json!({
+                        "clientId": client_id,
+                        "ruleIndex": p.rule_index,
+                        "ruleCount": p.rule_count,
+                        "currentTitle": p.current_title,
+                        "files": p.files,
+                        "bytes": p.bytes,
+                    }),
+                );
+            }
+        };
+        match rules.scan(&cancel, &mut progress) {
             Ok(result) => {
                 eprintln!(
                     "[purimaster] 垃圾扫描 {client_id} 完成: {} files, {} bytes",
@@ -248,6 +348,8 @@ fn scan_junk(app: AppHandle, state: State<'_, AppState>, client_id: String) -> R
         if active.as_deref() == Some(client_id.as_str()) {
             *active = None;
         }
+        drop(active);
+        reset_close_guard_if_idle(&tasks, &close_guard);
     });
 
     Ok(())
@@ -261,7 +363,10 @@ fn get_junk_cache(state: State<'_, AppState>) -> Option<JunkScanResult> {
 
 /// 清理选中的规则（ADR-0003：删除时重新枚举并逐文件重校验）。
 ///
-/// 事件：`clean://complete` `{ report: CleanReport }`。
+/// 事件（均带 `clientId`）：
+/// - `clean://progress` `{ deletedFiles, freedBytes, failedCount, currentTitle }`
+/// - `clean://complete` `{ report: CleanReport }`
+///
 /// `permanent=false` 时移入回收站（默认）；`dry_run=true` 时只做安全检查不删除。
 /// 报告中的 `report.cancelled` 表示被取消（已完成部分仍计入报告）。
 ///
@@ -295,6 +400,15 @@ fn clean_junk(
 
     let cancel = Arc::new(AtomicBool::new(false));
     let tasks = state.tasks.clone();
+    // 清理单飞：删除不可中断，运行中的清理不能被新请求取消——直接拒绝新请求
+    // （对比扫描类单飞"取消旧者"的不同策略，模拟用户测试 F-22/F-39）
+    {
+        let mut active = state.clean_active.lock().unwrap();
+        if active.is_some() {
+            return Err("已有清理任务正在进行，请等待其完成后再发起".into());
+        }
+        *active = Some(client_id.clone());
+    }
     tasks
         .lock()
         .unwrap()
@@ -309,8 +423,33 @@ fn clean_junk(
         "[purimaster] 清理 {client_id} 启动: rules={rule_ids:?}, mode={mode:?}, dry_run={dry_run}"
     );
     let last_clean = state.last_clean.clone();
+    let clean_active = state.clean_active.clone();
+    let close_guard = state.close_denied_at.clone();
     std::thread::spawn(move || {
-        let report = rules.clean(&rule_ids, &cancel, CleanOptions { mode, dry_run });
+        // 进度节流：清理可能持续数分钟，让用户看到推进（~6.6 次/秒）
+        let mut last_emit = Instant::now() - Duration::from_secs(1);
+        let mut progress = |p: purimaster_rules::CleanProgress| {
+            if last_emit.elapsed() >= Duration::from_millis(150) {
+                last_emit = Instant::now();
+                emit(
+                    &app,
+                    "clean://progress",
+                    serde_json::json!({
+                        "clientId": client_id,
+                        "deletedFiles": p.deleted_files,
+                        "freedBytes": p.freed_bytes,
+                        "failedCount": p.failed_count,
+                        "currentTitle": p.current_title,
+                    }),
+                );
+            }
+        };
+        let report = rules.clean(
+            &rule_ids,
+            &cancel,
+            CleanOptions { mode, dry_run },
+            &mut progress,
+        );
         eprintln!(
             "[purimaster] 清理 {client_id} 完成: deleted={} failed={} cancelled={}",
             report.deleted_files, report.failed_count, report.cancelled
@@ -323,6 +462,13 @@ fn clean_junk(
             serde_json::json!({ "clientId": client_id, "report": report }),
         );
         tasks.lock().unwrap().remove(&client_id);
+        {
+            let mut active = clean_active.lock().unwrap();
+            if active.as_deref() == Some(client_id.as_str()) {
+                *active = None;
+            }
+        }
+        reset_close_guard_if_idle(&tasks, &close_guard);
     });
 
     Ok(())
@@ -330,11 +476,370 @@ fn clean_junk(
 
 /// 取走最近一次清理报告（取回后清空，避免重复弹出）。
 ///
-/// 用于清理期间切换页签的场景：清理不在切页时取消（用户已确认删除），
-/// 报告由下次挂载的页面通过本命令取回。
+/// 防丢失的双机制分工（KeepAlive 引入后生效）：主路径是 JunkView 的事件监听器
+/// 在 KeepAlive 下永不注销，切页期间 `clean://complete` 仍由隐藏视图落账；
+/// 本命令是 WebView 重载/组件重挂载场景的兜底。两处注释互为引用，
+/// 改动任一机制前先检查另一个（JunkView onMounted 的取回逻辑）。
 #[tauri::command]
 fn take_clean_report(state: State<'_, AppState>) -> Option<CleanReport> {
     state.last_clean.lock().unwrap().take()
+}
+
+/// 删除用户在空间分析里手动勾选的文件（逐文件点名删除）。
+///
+/// 每个文件走 `delete_file_standalone`——真实路径保护检查、回收站预检、删除前
+/// 复检一项不少；受保护路径下的文件会计入 failed 而不是中断整批。
+/// 事件：`clean://progress` / `clean://complete`（与规则清理同构，报告由
+/// SpaceView 自己的报告弹窗展示）。**不写 `last_clean`**——那是规则清理的
+/// JunkView 兜底，写入手动删除的报告会在首次进入垃圾页时被误弹出。
+/// 单飞复用 `clean_active`：同一时间只允许一批删除。
+#[tauri::command]
+fn delete_files(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    client_id: String,
+    files: Vec<String>,
+    permanent: bool,
+    dry_run: bool,
+) -> Result<(), String> {
+    if client_id.is_empty() || client_id.len() > 128 {
+        return Err("非法的 clientId".into());
+    }
+    if files.is_empty() {
+        return Err("未选择任何文件".into());
+    }
+    if files.len() > 10_000 {
+        return Err("一次最多删除 10000 个文件".into());
+    }
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let tasks = state.tasks.clone();
+    {
+        let mut active = state.clean_active.lock().unwrap();
+        if active.is_some() {
+            return Err("已有清理/删除任务正在进行，请等待其完成后再发起".into());
+        }
+        *active = Some(client_id.clone());
+    }
+    tasks
+        .lock()
+        .unwrap()
+        .insert(client_id.clone(), cancel.clone());
+
+    let mode = if permanent {
+        DeleteMode::Permanent
+    } else {
+        DeleteMode::Trash
+    };
+    eprintln!(
+        "[purimaster] 手动删除 {client_id} 启动: {} 个文件, mode={mode:?}, dry_run={dry_run}",
+        files.len()
+    );
+    let clean_active = state.clean_active.clone();
+    let close_guard = state.close_denied_at.clone();
+    std::thread::spawn(move || {
+        const FAILED_PREVIEW: usize = 100;
+        let mut report = CleanReport {
+            dry_run,
+            mode: mode.as_str(),
+            deleted_files: 0,
+            freed_bytes: 0,
+            failed_count: 0,
+            failed: Vec::new(),
+            skipped: 0,
+            skipped_rules: Vec::new(),
+            cancelled: false,
+        };
+        let mut last_emit = Instant::now() - Duration::from_secs(1);
+        let total = files.len() as u64;
+        for (i, raw) in files.into_iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                report.cancelled = true;
+                break;
+            }
+            let path = std::path::PathBuf::from(&raw);
+            match purimaster_platform::delete_file_standalone(&path, mode, dry_run) {
+                Ok(size) => {
+                    report.deleted_files += 1;
+                    report.freed_bytes += size;
+                }
+                Err(e) => {
+                    report.failed_count += 1;
+                    if report.failed.len() < FAILED_PREVIEW {
+                        report.failed.push(purimaster_rules::CleanFileFailure {
+                            path: raw,
+                            error: e.to_string(),
+                        });
+                    }
+                }
+            }
+            // 进度节流与规则清理一致；total 已知，可带百分比口径的文案
+            if last_emit.elapsed() >= Duration::from_millis(150) || i as u64 + 1 == total {
+                last_emit = Instant::now();
+                emit(
+                    &app,
+                    "clean://progress",
+                    serde_json::json!({
+                        "clientId": client_id,
+                        "deletedFiles": report.deleted_files,
+                        "freedBytes": report.freed_bytes,
+                        "failedCount": report.failed_count,
+                        "currentTitle": format!("手动删除（{}/{})", i as u64 + 1, total),
+                    }),
+                );
+            }
+        }
+        eprintln!(
+            "[purimaster] 手动删除 {client_id} 完成: deleted={} failed={} cancelled={}",
+            report.deleted_files, report.failed_count, report.cancelled
+        );
+        emit(
+            &app,
+            "clean://complete",
+            serde_json::json!({ "clientId": client_id, "report": report }),
+        );
+        tasks.lock().unwrap().remove(&client_id);
+        {
+            let mut active = clean_active.lock().unwrap();
+            if active.as_deref() == Some(client_id.as_str()) {
+                *active = None;
+            }
+        }
+        reset_close_guard_if_idle(&tasks, &close_guard);
+    });
+
+    Ok(())
+}
+
+/// 启动一次"定向清理"扫描：用户指定单个目录（可带类型过滤/近期文件跳过），只读。
+///
+/// 与规则扫描共用同一安全管线——目录在构造临时规则集时过系统关键路径保护检查，
+/// 盘符根、受保护目录当场被拒（构造返回 Err 或目标带 problem 并在结果里可见）。
+/// 事件（均带 `clientId`）：`targeted://complete` `{ result }` / `targeted://cancelled`。
+/// 取消复用 `cancel_scan`；仅与定向扫描自身互斥（读操作，不与清理互斥）。
+#[tauri::command]
+fn scan_targeted(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    client_id: String,
+    path: String,
+    include: Vec<String>,
+    skip_recent: bool,
+) -> Result<(), String> {
+    if client_id.is_empty() || client_id.len() > 128 {
+        return Err("非法的 clientId".into());
+    }
+    let root = normalize_scan_root(&path)?;
+    if !root.is_dir() {
+        return Err(format!("目录不存在：{}", path.trim()));
+    }
+    let min_age = skip_recent.then(|| Duration::from_secs(24 * 3600));
+    let rules = purimaster_rules::RuleSet::targeted(
+        &root,
+        &include,
+        min_age,
+        &purimaster_platform::protection(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let tasks = state.tasks.clone();
+    let targeted_active = state.targeted_active.clone();
+    let close_guard = state.close_denied_at.clone();
+    // 单飞（仅定向扫描自身）：新的定向扫描自动取消旧的
+    {
+        let mut active = targeted_active.lock().unwrap();
+        if let Some(prev) = active.as_ref()
+            && let Some(flag) = tasks.lock().unwrap().get(prev)
+        {
+            flag.store(true, Ordering::Relaxed);
+        }
+        *active = Some(client_id.clone());
+    }
+    tasks
+        .lock()
+        .unwrap()
+        .insert(client_id.clone(), cancel.clone());
+
+    eprintln!("[purimaster] 定向扫描 {client_id} 启动: {}", root.display());
+    std::thread::spawn(move || {
+        match rules.scan(&cancel, &mut |_| {}) {
+            Ok(result) => {
+                eprintln!(
+                    "[purimaster] 定向扫描 {client_id} 完成: {} files, {} bytes",
+                    result.total_files, result.total_bytes
+                );
+                emit(
+                    &app,
+                    "targeted://complete",
+                    serde_json::json!({ "clientId": client_id, "result": result }),
+                );
+            }
+            Err(_) => {
+                emit(
+                    &app,
+                    "targeted://cancelled",
+                    serde_json::json!({ "clientId": client_id }),
+                );
+            }
+        }
+        tasks.lock().unwrap().remove(&client_id);
+        let mut active = targeted_active.lock().unwrap();
+        if active.as_deref() == Some(client_id.as_str()) {
+            *active = None;
+        }
+        drop(active);
+        reset_close_guard_if_idle(&tasks, &close_guard);
+    });
+
+    Ok(())
+}
+
+/// 定向清理请求参数（打包为结构体：清理选项与身份标识分离，避免命令参数过长）。
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TargetedRequest {
+    path: String,
+    include: Vec<String>,
+    skip_recent: bool,
+    permanent: bool,
+    dry_run: bool,
+}
+
+/// 清理用户指定的目录（定向清理）：与规则清理走同一删除管线与报告结构。
+///
+/// 规则集在**清理时重新构造**——构造即重过保护检查，不信任扫描时点的状态
+/// （ADR-0003）。事件：`clean://progress` / `clean://complete`（与 `clean_junk`
+/// 同构，报告由同一弹窗展示）。单飞策略同 `clean_junk`：运行中拒绝新清理。
+#[tauri::command]
+fn clean_targeted(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    client_id: String,
+    request: TargetedRequest,
+) -> Result<(), String> {
+    let TargetedRequest {
+        path,
+        include,
+        skip_recent,
+        permanent,
+        dry_run,
+    } = request;
+    if client_id.is_empty() || client_id.len() > 128 {
+        return Err("非法的 clientId".into());
+    }
+    let root = normalize_scan_root(&path)?;
+    if !root.is_dir() {
+        return Err(format!("目录不存在：{}", path.trim()));
+    }
+    let min_age = skip_recent.then(|| Duration::from_secs(24 * 3600));
+    let rules = purimaster_rules::RuleSet::targeted(
+        &root,
+        &include,
+        min_age,
+        &purimaster_platform::protection(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let tasks = state.tasks.clone();
+    {
+        let mut active = state.clean_active.lock().unwrap();
+        if active.is_some() {
+            return Err("已有清理任务正在进行，请等待其完成后再发起".into());
+        }
+        *active = Some(client_id.clone());
+    }
+    tasks
+        .lock()
+        .unwrap()
+        .insert(client_id.clone(), cancel.clone());
+
+    let mode = if permanent {
+        DeleteMode::Permanent
+    } else {
+        DeleteMode::Trash
+    };
+    eprintln!(
+        "[purimaster] 定向清理 {client_id} 启动: {} mode={mode:?} dry_run={dry_run}",
+        root.display()
+    );
+    let last_clean = state.last_clean.clone();
+    let clean_active = state.clean_active.clone();
+    let close_guard = state.close_denied_at.clone();
+    std::thread::spawn(move || {
+        let mut last_emit = Instant::now() - Duration::from_secs(1);
+        let mut progress = |p: purimaster_rules::CleanProgress| {
+            if last_emit.elapsed() >= Duration::from_millis(150) {
+                last_emit = Instant::now();
+                emit(
+                    &app,
+                    "clean://progress",
+                    serde_json::json!({
+                        "clientId": client_id,
+                        "deletedFiles": p.deleted_files,
+                        "freedBytes": p.freed_bytes,
+                        "failedCount": p.failed_count,
+                        "currentTitle": p.current_title,
+                    }),
+                );
+            }
+        };
+        let report = rules.clean(
+            &["targeted".to_string()],
+            &cancel,
+            CleanOptions { mode, dry_run },
+            &mut progress,
+        );
+        eprintln!(
+            "[purimaster] 定向清理 {client_id} 完成: deleted={} failed={}",
+            report.deleted_files, report.failed_count
+        );
+        *last_clean.lock().unwrap() = Some(report.clone());
+        emit(
+            &app,
+            "clean://complete",
+            serde_json::json!({ "clientId": client_id, "report": report }),
+        );
+        tasks.lock().unwrap().remove(&client_id);
+        {
+            let mut active = clean_active.lock().unwrap();
+            if active.as_deref() == Some(client_id.as_str()) {
+                *active = None;
+            }
+        }
+        reset_close_guard_if_idle(&tasks, &close_guard);
+    });
+
+    Ok(())
+}
+
+/// 用户在"任务进行中"确认框选择继续等待：复位关窗保护，下次关闭重新弹确认。
+#[tauri::command]
+fn allow_close(state: State<'_, AppState>) {
+    *state.close_denied_at.lock().unwrap() = None;
+}
+
+/// 打开系统回收站（清理报告页的"打开回收站"入口，帮用户走完最后一步）。
+#[tauri::command]
+fn open_recycle_bin() -> Result<(), String> {
+    std::process::Command::new("explorer")
+        .arg("shell:RecycleBinFolder")
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打开回收站失败：{e}"))
+}
+
+/// 用户确认退出：取消全部任务后立即退出进程。
+///
+/// 清理线程是 detached 的，进程退出会中断正在进行中的删除批次；
+/// 此路径只在用户显式确认后走到（CloseRequested 保护见 on_window_event）。
+#[tauri::command]
+fn quit_app(app: AppHandle, state: State<'_, AppState>) {
+    for flag in state.tasks.lock().unwrap().values() {
+        flag.store(true, Ordering::Relaxed);
+    }
+    app.exit(0);
 }
 
 /// 解析规则目录：优先打包资源目录；开发模式（仅 debug 构建）从可执行文件向上最多找 4 层，
@@ -362,17 +867,255 @@ fn resolve_rules_dir(app: &AppHandle) -> Option<std::path::PathBuf> {
     None
 }
 
-/// 列出目录直属文件清单（按大小降序，最多 `limit` 条，默认 200）。
+/// 列出目录直属文件清单（按大小降序，第 `offset` 起最多 `limit` 条，默认 200）。
 ///
 /// async + spawn_blocking：枚举在后台线程执行，不阻塞 WebView 主线程。
 #[tauri::command]
-async fn list_files(dir: String, limit: Option<u32>) -> Result<FileListing, String> {
+async fn list_files(
+    dir: String,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<FileListing, String> {
     let limit = limit.unwrap_or(200) as usize;
+    let offset = offset.unwrap_or(0) as usize;
     tauri::async_runtime::spawn_blocking(move || {
-        purimaster_core::list_files(Path::new(&dir), limit).map_err(|e| e.to_string())
+        purimaster_core::list_files(Path::new(&dir), limit, offset).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// 枚举本机盘符（空间分析页的快捷入口）。
+#[tauri::command]
+fn list_drives() -> Vec<purimaster_platform::DriveInfo> {
+    purimaster_platform::list_drives()
+}
+
+// ---------------------------------------------------------------------------
+// 软件卸载（ADR-0004：官方卸载器优先，注册表删除守卫，残留逐项确认）
+// ---------------------------------------------------------------------------
+
+/// 枚举已安装程序（注册表三个卸载键，跳过系统组件条目）。
+#[tauri::command]
+fn list_programs() -> Vec<purimaster_platform::InstalledProgram> {
+    purimaster_platform::list_installed_programs()
+}
+
+/// 逐个执行所选程序的官方卸载器并等待（最长每个 10 分钟）。
+///
+/// 事件（均带 `clientId`）：`uninstall://progress` `{ index, total, name, status }`、
+/// `uninstall://complete` `{ results: [{ name, ok, detail }] }`。
+/// 单飞复用 `clean_active`（卸载属于"清理型"操作，与删除互斥）。
+#[tauri::command]
+fn uninstall_programs(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    client_id: String,
+    programs: Vec<purimaster_platform::InstalledProgram>,
+) -> Result<(), String> {
+    if client_id.is_empty() || client_id.len() > 128 {
+        return Err("非法的 clientId".into());
+    }
+    if programs.is_empty() {
+        return Err("未选择任何软件".into());
+    }
+    if programs.len() > 100 {
+        return Err("一次最多卸载 100 个软件".into());
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let tasks = state.tasks.clone();
+    {
+        let mut active = state.clean_active.lock().unwrap();
+        if active.is_some() {
+            return Err("已有清理/删除/卸载任务正在进行，请等待其完成".into());
+        }
+        *active = Some(client_id.clone());
+    }
+    tasks
+        .lock()
+        .unwrap()
+        .insert(client_id.clone(), cancel.clone());
+
+    let total = programs.len();
+    eprintln!("[purimaster] 卸载 {client_id} 启动: {total} 个软件");
+    let clean_active = state.clean_active.clone();
+    let close_guard = state.close_denied_at.clone();
+    std::thread::spawn(move || {
+        let mut results: Vec<serde_json::Value> = Vec::new();
+        for (i, prog) in programs.into_iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            emit(
+                &app,
+                "uninstall://progress",
+                serde_json::json!({
+                    "clientId": client_id,
+                    "index": i + 1,
+                    "total": total,
+                    "name": prog.display_name,
+                    "status": "正在运行官方卸载器（请在弹出的窗口中完成卸载）…",
+                }),
+            );
+            let detail = purimaster_platform::run_uninstaller(&prog.uninstall_string);
+            let (ok, detail) = match detail {
+                Ok(msg) => (true, msg),
+                Err(msg) => (false, msg),
+            };
+            emit(
+                &app,
+                "uninstall://progress",
+                serde_json::json!({
+                    "clientId": client_id,
+                    "index": i + 1,
+                    "total": total,
+                    "name": prog.display_name,
+                    "status": detail,
+                }),
+            );
+            results.push(serde_json::json!({
+                "name": prog.display_name,
+                "ok": ok,
+                "detail": detail,
+            }));
+        }
+        emit(
+            &app,
+            "uninstall://complete",
+            serde_json::json!({ "clientId": client_id, "results": results }),
+        );
+        tasks.lock().unwrap().remove(&client_id);
+        {
+            let mut active = clean_active.lock().unwrap();
+            if active.as_deref() == Some(client_id.as_str()) {
+                *active = None;
+            }
+        }
+        reset_close_guard_if_idle(&tasks, &close_guard);
+    });
+
+    Ok(())
+}
+
+/// 扫描一个已卸载软件的残留（文件目录 + 注册表键，名称精确匹配）。
+#[tauri::command]
+async fn scan_residue(
+    program: purimaster_platform::InstalledProgram,
+) -> Result<purimaster_platform::ResidueReport, String> {
+    tauri::async_runtime::spawn_blocking(move || purimaster_platform::scan_residue(&program))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 删除已勾选的残留（文件目录树 + 守卫式注册表键树），报告复用 `clean://complete`。
+#[tauri::command]
+fn delete_residue(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    client_id: String,
+    files: Vec<String>,
+    registry: Vec<String>,
+    dry_run: bool,
+) -> Result<(), String> {
+    if client_id.is_empty() || client_id.len() > 128 {
+        return Err("非法的 clientId".into());
+    }
+    if files.is_empty() && registry.is_empty() {
+        return Err("未选择任何残留项".into());
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let tasks = state.tasks.clone();
+    {
+        let mut active = state.clean_active.lock().unwrap();
+        if active.is_some() {
+            return Err("已有清理/删除/卸载任务正在进行，请等待其完成".into());
+        }
+        *active = Some(client_id.clone());
+    }
+    tasks
+        .lock()
+        .unwrap()
+        .insert(client_id.clone(), cancel.clone());
+
+    eprintln!(
+        "[purimaster] 残留清理 {client_id} 启动: {} 目录 / {} 注册表键, dry_run={dry_run}",
+        files.len(),
+        registry.len()
+    );
+    let clean_active = state.clean_active.clone();
+    let close_guard = state.close_denied_at.clone();
+    std::thread::spawn(move || {
+        let mut report = CleanReport {
+            dry_run,
+            mode: "permanent",
+            deleted_files: 0,
+            freed_bytes: 0,
+            failed_count: 0,
+            failed: Vec::new(),
+            skipped: 0,
+            skipped_rules: Vec::new(),
+            cancelled: false,
+        };
+        for raw in &files {
+            if cancel.load(Ordering::Relaxed) {
+                report.cancelled = true;
+                break;
+            }
+            match purimaster_platform::remove_dir_tree_standalone(Path::new(raw), dry_run) {
+                Ok(count) => {
+                    report.deleted_files += count;
+                }
+                Err(e) => {
+                    report.failed_count += 1;
+                    report.failed.push(CleanFileFailure {
+                        path: raw.clone(),
+                        error: e.to_string(),
+                    });
+                }
+            }
+        }
+        for key in &registry {
+            if cancel.load(Ordering::Relaxed) {
+                report.cancelled = true;
+                break;
+            }
+            if dry_run {
+                report
+                    .skipped_rules
+                    .push(format!("预演：注册表键 {key}（将删除）"));
+                continue;
+            }
+            match purimaster_platform::delete_registry_tree(key) {
+                Ok(()) => report.deleted_files += 1,
+                Err(e) => {
+                    report.failed_count += 1;
+                    report.failed.push(CleanFileFailure {
+                        path: key.clone(),
+                        error: e,
+                    });
+                }
+            }
+        }
+        eprintln!(
+            "[purimaster] 残留清理 {client_id} 完成: deleted={} failed={}",
+            report.deleted_files, report.failed_count
+        );
+        emit(
+            &app,
+            "clean://complete",
+            serde_json::json!({ "clientId": client_id, "report": report }),
+        );
+        tasks.lock().unwrap().remove(&client_id);
+        {
+            let mut active = clean_active.lock().unwrap();
+            if active.as_deref() == Some(client_id.as_str()) {
+                *active = None;
+            }
+        }
+        reset_close_guard_if_idle(&tasks, &close_guard);
+    });
+
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -407,9 +1150,41 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // 关闭窗口时统一发出取消信号，避免扫描线程在退出期间继续阻塞
-            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+            // 关窗保护：有任务运行时阻止首次关闭并通知前端弹确认框。
+            // 首次阻止后进入 1.5 秒武装窗口（CLOSE_ARMING）：期间的重复关窗直接忽略，
+            // 防止性急双击 X 在 WebView 弹出确认框前就落穿放行、中断不可回滚的删除批次
+            // （模拟用户测试 F-35）。武装期过后再次关闭视为坚持退出——同时覆盖
+            // WebView 无响应收不到确认框事件的场景。任务表清空时复位保护状态
+            // （reset_close_guard_if_idle），避免残留标志让下一次关窗跳过确认（F-16）。
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let state = window.app_handle().state::<AppState>();
+                let running = state.tasks.lock().unwrap().len();
+                if running == 0 {
+                    *state.close_denied_at.lock().unwrap() = None;
+                } else {
+                    let mut guard = state.close_denied_at.lock().unwrap();
+                    match *guard {
+                        None => {
+                            *guard = Some(Instant::now());
+                            let cleaning = state.clean_active.lock().unwrap().is_some();
+                            api.prevent_close();
+                            emit(
+                                window.app_handle(),
+                                "app://close-busy",
+                                serde_json::json!({ "running": running, "cleaning": cleaning }),
+                            );
+                            return;
+                        }
+                        Some(t) if t.elapsed() < CLOSE_ARMING => {
+                            api.prevent_close();
+                            return;
+                        }
+                        Some(_) => {
+                            *guard = None; // 坚持退出：放行
+                        }
+                    }
+                }
+                // 放行关闭前统一取消任务，避免退出期间扫描/清理线程继续占用
                 for flag in state.tasks.lock().unwrap().values() {
                     flag.store(true, Ordering::Relaxed);
                 }
@@ -420,10 +1195,21 @@ pub fn run() {
             cancel_scan,
             dir_children,
             list_files,
+            list_drives,
             scan_junk,
             clean_junk,
+            scan_targeted,
+            clean_targeted,
+            delete_files,
+            list_programs,
+            uninstall_programs,
+            scan_residue,
+            delete_residue,
             take_clean_report,
             get_junk_cache,
+            allow_close,
+            quit_app,
+            open_recycle_bin,
             ipc_hello
         ])
         .run(tauri::generate_context!())
