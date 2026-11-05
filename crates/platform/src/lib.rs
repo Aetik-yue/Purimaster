@@ -280,8 +280,18 @@ pub fn list_drives() -> Vec<DriveInfo> {
     Vec::new()
 }
 
-/// 规范化：去掉 `\\?\` / `\\?\UNC\` 前缀、小写、正斜杠转反斜杠、去掉末尾分隔符。
-fn normalize(path: &Path) -> String {
+/// Windows 路径比较键：去掉 `\\?\` / `\\?\UNC\` 前缀、全 Unicode 小写折叠、
+/// 正斜杠转反斜杠、去掉末尾分隔符。
+///
+/// 公开给 `purimaster-rules` 复用：路径去重（scan/clean 归属统计）与保护检查
+/// 必须使用**同一个**比较键，否则两种拼法（如 `…\Jürgen` 与 `…\JÜRGEN`）在
+/// 保护检查眼里是同一目录、在去重眼里却是两个——确认统计会虚高。
+///
+/// 大小写折叠用 `str::to_lowercase`（NTFS 的 $UpCase 表覆盖全 Unicode，
+/// ASCII 小写化不够）；纯 ASCII 输入走 std 内建快速路径，开销与
+/// `to_ascii_lowercase` 同级。折叠范围偏大在本项目里是安全方向：
+/// 去重少计（不漏删），保护检查多拦（不放过）。
+pub fn normalize(path: &Path) -> String {
     let raw = path.to_string_lossy();
     let stripped = if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")
@@ -290,7 +300,7 @@ fn normalize(path: &Path) -> String {
     } else {
         raw.into_owned()
     };
-    let mut s = stripped.replace('/', "\\").to_ascii_lowercase();
+    let mut s = stripped.replace('/', "\\").to_lowercase();
     while s.len() > 3 && s.ends_with('\\') {
         s.pop();
     }

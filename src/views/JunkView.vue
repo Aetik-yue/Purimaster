@@ -666,20 +666,22 @@ function groupTargetsSummary(group: JunkGroup): string {
             </p>
           </div>
           <template v-if="targetedGroup.files > 0">
-            <label class="option">
-              <input v-model="mode" type="radio" value="trash" />
-              移入回收站（推荐，可恢复）
-            </label>
-            <label class="option">
-              <input v-model="mode" type="radio" value="permanent" />
-              永久删除（不可恢复）
-            </label>
-            <label class="option">
-              <input v-model="dryRun" type="checkbox" />
-              先预演（只检查，不删除任何文件）
-            </label>
+            <div class="option-group">
+              <label class="option">
+                <input v-model="mode" type="radio" value="trash" />
+                移入回收站（推荐，可恢复）
+              </label>
+              <label class="option">
+                <input v-model="mode" type="radio" value="permanent" />
+                永久删除（不可恢复）
+              </label>
+              <label class="option">
+                <input v-model="dryRun" type="checkbox" />
+                先预演（只检查，不删除任何文件）
+              </label>
+            </div>
             <template v-if="mode === 'permanent' && !dryRun">
-              <p class="warn">⚠ 永久删除将绕过回收站直接删除，无法恢复。请输入「删除」确认。</p>
+              <p class="warn danger-note">⚠ 永久删除将绕过回收站直接删除，无法恢复。请输入「删除」确认。</p>
               <input
                 ref="confirmWordInput"
                 v-model="confirmWord"
@@ -743,25 +745,27 @@ function groupTargetsSummary(group: JunkGroup): string {
         <p v-if="hasRiskSelection" class="warn">
           ⚠ 所选内容包含中/高风险项目，请确认「详情」里的目标与文件确实可以丢弃。
         </p>
-        <label class="option">
-          <input v-model="mode" type="radio" value="trash" />
-          移入回收站（推荐，可恢复）
-        </label>
-        <label class="option">
-          <input v-model="mode" type="radio" value="permanent" />
-          永久删除（不可恢复）
-        </label>
-        <label class="option">
-          <input v-model="dryRun" type="checkbox" />
-          先预演（只检查，不删除任何文件）
-        </label>
+        <div class="option-group">
+          <label class="option">
+            <input v-model="mode" type="radio" value="trash" />
+            移入回收站（推荐，可恢复）
+          </label>
+          <label class="option">
+            <input v-model="mode" type="radio" value="permanent" />
+            永久删除（不可恢复）
+          </label>
+          <label class="option">
+            <input v-model="dryRun" type="checkbox" />
+            先预演（只检查，不删除任何文件）
+          </label>
+        </div>
         <p class="detail-line muted option-explain">
           回收站：文件可随时还原，磁盘空间在清空回收站后才真正释放。永久删除：绕过回收站，
           事后无法恢复。预演：列出将要处理的文件，不动任何东西。个别文件若正被占用会删除失败
           并在报告中列出，不影响其余文件。
         </p>
         <template v-if="mode === 'permanent' && !dryRun">
-          <p class="warn">
+          <p class="warn danger-note">
             ⚠ 永久删除将绕过回收站直接删除文件，事后无法通过任何方式恢复。
             请输入「删除」以确认执行。
           </p>
@@ -794,38 +798,34 @@ function groupTargetsSummary(group: JunkGroup): string {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--space-3);
 }
 
 .toolbar {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-3);
   flex-shrink: 0;
 }
 
-.ghost {
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--text);
-}
+/* ghost 按钮统一由全局 button.ghost 提供（hover = accent-soft 淡底） */
 
 .status {
   color: var(--accent);
 }
 
 .big-status {
-  font-size: 15px;
+  font-size: var(--font-md);
 }
 
 .error {
   color: var(--danger);
 }
 
-/* 扫描进度条 */
+/* 扫描进度条：4px 细条，填充松绿（版式规则 8） */
 .scan-bar {
   height: 4px;
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background: var(--border);
   overflow: hidden;
   flex-shrink: 0;
@@ -834,8 +834,8 @@ function groupTargetsSummary(group: JunkGroup): string {
 .scan-bar-fill {
   height: 100%;
   background: var(--accent);
-  border-radius: 2px;
-  transition: width 0.25s ease;
+  border-radius: var(--radius-xs);
+  transition: width var(--dur) var(--ease);
 }
 
 .result {
@@ -843,18 +843,18 @@ function groupTargetsSummary(group: JunkGroup): string {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--space-3);
 }
 
-/* 主视觉区 */
+/* 主视觉区：英雄数字（34px 展示级）与 12px 说明差近 3 倍字号（版式规则 1） */
 .hero {
   display: flex;
   align-items: center;
-  gap: 24px;
-  padding: 18px 24px;
+  gap: var(--space-6);
+  padding: var(--space-5) var(--space-6);
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: var(--radius-lg);
 }
 
 .hero-main {
@@ -862,58 +862,56 @@ function groupTargetsSummary(group: JunkGroup): string {
 }
 
 .hero-label {
-  font-size: 12px;
+  font-size: var(--font-xs);
   color: var(--text-secondary);
 }
 
 .hero-number {
-  font-size: 34px;
+  font-size: 34px; /* 视图内英雄数字，与 --font-display 同为展示级 */
   font-weight: 700;
+  letter-spacing: -0.01em;
   font-variant-numeric: tabular-nums;
   color: var(--text);
-  line-height: 1.15;
+  line-height: 1.1;
+  margin: var(--space-1) 0;
 }
 
 .hero-sub {
-  font-size: 12px;
+  font-size: var(--font-xs);
   color: var(--text-secondary);
 }
 
 .clean-now {
-  font-size: 16px;
-  padding: 12px 34px;
-  border-radius: 10px;
-}
-
-.clean-now:disabled {
-  opacity: 0.45;
+  font-size: var(--font-lg);
+  padding: var(--space-3) var(--space-8);
+  border-radius: var(--radius);
 }
 
 .empty {
-  color: #1a9e55;
-  font-size: 15px;
-  padding: 24px;
+  color: var(--success);
+  font-size: var(--font-md);
+  padding: var(--space-8) var(--space-6);
   text-align: center;
 }
 
 .list-hint {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-3);
   flex-shrink: 0;
 }
 
 .select-all {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-2);
   cursor: pointer;
   user-select: none;
-  font-size: 13px;
+  font-size: var(--font-sm);
 }
 
 .hint-text {
-  font-size: 12px;
+  font-size: var(--font-xs);
   color: var(--text-secondary);
 }
 
@@ -924,37 +922,42 @@ function groupTargetsSummary(group: JunkGroup): string {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 10px 14px;
+  padding: var(--space-2) var(--space-4);
 }
 
 .category {
-  margin-bottom: 14px;
+  margin-bottom: var(--space-4);
 }
 
 .category-title {
-  font-size: 13px;
+  font-size: var(--font-sm);
+  font-weight: 600;
+  letter-spacing: 0.02em;
   color: var(--text-secondary);
-  margin: 8px 0 4px;
+  margin: var(--space-2) 0 var(--space-1);
 }
 
 .group-row {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
-  border-radius: 8px;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius);
   cursor: pointer;
   user-select: none;
   border: 1px solid transparent;
+  transition: background-color var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease);
 }
 
+/* hover / 选中统一 accent-soft 淡底；选中另加 border-strong 描边（版式规则 5） */
 .group-row:hover {
-  background: rgba(47, 111, 237, 0.06);
+  background: var(--accent-soft);
 }
 
 .group-row.selected {
-  background: rgba(47, 111, 237, 0.08);
-  border-color: rgba(47, 111, 237, 0.25);
+  background: var(--accent-soft);
+  border-color: var(--border-strong);
 }
 
 .group-row.dimmed {
@@ -973,46 +976,51 @@ function groupTargetsSummary(group: JunkGroup): string {
 .group-line {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .group-title {
   font-weight: 500;
 }
 
+/* 徽章：--font-xs + 对应语义 soft 底（soft 底由语义色混 surface 得出，
+   与 DirTree.vue 徽章同一配方），视觉重量随风险递增 */
 .badge {
-  padding: 1px 6px;
-  font-size: 11px;
-  border-radius: 4px;
+  padding: 1px var(--space-2);
+  font-size: var(--font-xs);
+  font-weight: 500;
+  line-height: 18px;
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
 }
 
 .risk-low {
-  color: #1a7f47;
-  background: #e6f6ec;
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 8%, var(--surface));
 }
 
 .risk-medium {
-  color: #b45309;
-  background: #fef3c7;
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 8%, var(--surface));
 }
 
 .risk-high {
-  color: #b91c1c;
-  background: #fee2e2;
+  color: var(--danger);
+  background: var(--danger-soft);
 }
 
 .badge.scan-only {
-  color: #475569;
-  background: #e2e8f0;
+  color: var(--text-secondary);
+  background: var(--bg);
 }
 
 .problem-dot {
-  color: #b45309;
-  font-size: 12px;
+  color: var(--warning);
+  font-size: var(--font-xs);
 }
 
 .group-sub {
-  font-size: 12px;
+  font-size: var(--font-xs);
   color: var(--text-secondary);
 }
 
@@ -1028,8 +1036,8 @@ function groupTargetsSummary(group: JunkGroup): string {
   background: transparent;
   border: none;
   color: var(--text-secondary);
-  font-size: 12px;
-  padding: 4px 8px;
+  font-size: var(--font-xs);
+  padding: var(--space-1) var(--space-2);
 }
 
 .detail-btn:hover {
@@ -1037,27 +1045,23 @@ function groupTargetsSummary(group: JunkGroup): string {
 }
 
 .group-detail {
-  padding: 6px 12px 10px 40px;
+  padding: var(--space-1) var(--space-3) var(--space-2) 40px;
 }
 
 .detail-line {
-  font-size: 12px;
+  font-size: var(--font-xs);
   color: var(--text-secondary);
-  padding: 2px 0;
+  padding: var(--space-1) 0;
   word-break: break-all;
 }
 
 .detail-line.problem {
-  color: #b45309;
-}
-
-.detail-line.muted {
-  font-size: 11px;
+  color: var(--warning);
 }
 
 .detail-label {
   display: inline-block;
-  margin-right: 8px;
+  margin-right: var(--space-2);
   color: var(--text);
 }
 
@@ -1066,16 +1070,16 @@ function groupTargetsSummary(group: JunkGroup): string {
 }
 
 .files {
-  margin-top: 6px;
+  margin-top: var(--space-2);
   border-top: 1px dashed var(--border);
-  padding-top: 6px;
+  padding-top: var(--space-2);
 }
 
 .file-row {
   display: flex;
-  gap: 12px;
-  padding: 2px 0;
-  font-size: 12px;
+  gap: var(--space-3);
+  padding: var(--space-1) 0;
+  font-size: var(--font-xs);
 }
 
 .file-path {
@@ -1094,7 +1098,7 @@ function groupTargetsSummary(group: JunkGroup): string {
 .overlay {
   position: fixed;
   inset: 0;
-  background: rgba(15, 23, 42, 0.45);
+  background: var(--scrim);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1105,12 +1109,13 @@ function groupTargetsSummary(group: JunkGroup): string {
   width: 460px;
   max-width: calc(100vw - 48px);
   background: var(--surface);
-  border-radius: 10px;
-  padding: 20px 22px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5) var(--space-6);
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.25);
+  gap: var(--space-3);
+  box-shadow: var(--shadow-3);
 }
 
 .modal.wide {
@@ -1118,100 +1123,104 @@ function groupTargetsSummary(group: JunkGroup): string {
 }
 
 .modal h3 {
-  font-size: 16px;
+  font-size: var(--font-lg);
 }
 
 .cancel-tag {
-  font-size: 12px;
+  font-size: var(--font-xs);
   font-weight: 400;
-  color: #b45309;
-  margin-left: 6px;
+  color: var(--warning);
+  margin-left: var(--space-2);
 }
 
+/* 确认清单：内嵌浅底列表，行距 4px 网格 */
 .confirm-list {
   max-height: 180px;
   overflow-y: auto;
   border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 6px 10px;
+  border-radius: var(--radius);
+  background: var(--bg);
+  padding: var(--space-1) var(--space-3);
 }
 
 .confirm-row {
   display: flex;
   justify-content: space-between;
-  padding: 3px 0;
-  font-size: 13px;
+  font-size: var(--font-sm);
 }
 
 .confirm-item {
-  padding: 3px 0;
+  padding: var(--space-1) 0;
 }
 
 .confirm-desc {
-  font-size: 12px;
+  font-size: var(--font-xs);
   color: var(--text-secondary);
-  padding: 1px 0 3px;
+  padding-top: var(--space-1);
+}
+
+/* 选项组：1px 细线分隔"清什么"与"怎么清"（版式规则 4） */
+.option-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  border-top: 1px solid var(--border);
+  padding-top: var(--space-3);
 }
 
 .option-explain {
-  padding: 2px 0 4px;
   line-height: 1.6;
 }
 
 .targeted-btn {
-  font-size: 16px;
-  padding: 12px 22px;
-  border-radius: 10px;
+  font-size: var(--font-lg);
+  padding: var(--space-3) var(--space-5);
+  border-radius: var(--radius);
 }
 
 .field {
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: var(--space-1);
 }
 
 .field-label {
-  font-size: 12px;
+  font-size: var(--font-xs);
   color: var(--text-secondary);
 }
 
 .targeted-summary {
-  font-size: 14px;
+  font-size: var(--font-md);
 }
 
 .targeted-problems {
   max-height: 96px;
   overflow-y: auto;
   border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 6px 10px;
+  border-radius: var(--radius);
+  padding: var(--space-1) var(--space-3);
 }
 
 .targeted-files {
   max-height: 200px;
   overflow-y: auto;
   border-top: 1px dashed var(--border);
-  padding-top: 6px;
+  padding-top: var(--space-2);
 }
 
 .scan-cancel {
-  margin-left: 10px;
-  padding: 2px 12px;
-  font-size: 12px;
+  margin-left: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--font-xs);
 }
 
 .confirm-title {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-2);
 }
 
-.confirm-word {
-  padding: 8px 10px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  font-size: 14px;
-}
+/* 确认词输入框样式全部交给全局 input（含聚焦软环） */
 
 .confirm-size {
   color: var(--text-secondary);
@@ -1222,28 +1231,45 @@ function groupTargetsSummary(group: JunkGroup): string {
   color: var(--text-secondary);
 }
 
+.modal-line strong {
+  color: var(--text);
+}
+
 .option {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   cursor: pointer;
 }
 
+/* 警示分级：琥珀 = 需要确认的注意事项；danger-note 红块 = 永久删除等危险操作 */
 .warn {
-  color: #b91c1c;
-  font-size: 12px;
+  color: var(--warning);
+  font-size: var(--font-xs);
+}
+
+.warn.danger-note {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
 }
 
 .modal-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 10px;
-  margin-top: 6px;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
 }
 
 .modal-actions button {
   background: transparent;
   border: 1px solid var(--border);
+}
+
+.modal-actions button:hover {
+  background: var(--bg);
+  border-color: var(--border-strong);
 }
 
 .modal-actions button.primary {
@@ -1252,22 +1278,27 @@ function groupTargetsSummary(group: JunkGroup): string {
   color: #fff;
 }
 
+.modal-actions button.primary:hover {
+  background: var(--accent-hover);
+  border-color: transparent;
+}
+
 .failures {
   max-height: 220px;
   overflow-y: auto;
   border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 8px;
+  border-radius: var(--radius);
+  padding: var(--space-2);
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--space-2);
 }
 
 .fail-row {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  font-size: 12px;
+  gap: var(--space-1);
+  font-size: var(--font-xs);
 }
 
 .fail-path {
@@ -1276,11 +1307,11 @@ function groupTargetsSummary(group: JunkGroup): string {
 }
 
 .fail-err {
-  color: #b91c1c;
+  color: var(--danger);
 }
 
 .skipped {
-  font-size: 12px;
+  font-size: var(--font-xs);
   color: var(--text-secondary);
 }
 

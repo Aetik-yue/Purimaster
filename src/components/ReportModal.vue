@@ -89,23 +89,32 @@ async function openRecycleBin() {
 .overlay {
   position: fixed;
   inset: 0;
-  background: rgba(15, 23, 42, 0.45);
+  background: var(--scrim);
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 50;
+  /* 显隐动效：0.2s 淡入（--dur 区间），无位移 */
+  animation: overlay-in var(--dur) var(--ease);
+}
+
+@keyframes overlay-in {
+  from {
+    opacity: 0;
+  }
 }
 
 .modal {
   width: 460px;
   max-width: calc(100vw - 48px);
   background: var(--surface);
-  border-radius: 10px;
-  padding: 20px 22px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5) var(--space-6);
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.25);
+  gap: var(--space-3);
+  box-shadow: var(--shadow-3);
 }
 
 .modal.wide {
@@ -113,52 +122,59 @@ async function openRecycleBin() {
 }
 
 .modal h3 {
-  font-size: 16px;
+  font-size: var(--font-lg);
 }
 
+/* 已取消：警示琥珀（存量语义色），不加底色保持克制 */
 .cancel-tag {
-  font-size: 12px;
+  font-size: var(--font-xs);
   font-weight: 400;
-  color: #b45309;
-  margin-left: 6px;
+  color: var(--warning);
+  margin-left: var(--space-1);
 }
 
 .modal-line {
   color: var(--text-secondary);
+  font-size: var(--font-md);
+}
+
+/* 数字是报告主角：文件数与字节数提亮到主文本色，与说明文字拉开层级 */
+.modal-line strong {
+  color: var(--text);
 }
 
 .warn {
-  color: #b91c1c;
-  font-size: 12px;
+  color: var(--danger);
+  font-size: var(--font-xs);
 }
 
 .detail-line {
-  font-size: 12px;
+  font-size: var(--font-sm);
   color: var(--text-secondary);
   padding: 2px 0;
   word-break: break-all;
 }
 
 .detail-line.muted {
-  font-size: 11px;
+  font-size: var(--font-xs);
 }
 
 .failures {
-  max-height: 220px;
+  max-height: 224px;
   overflow-y: auto;
   border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 8px;
+  border-radius: var(--radius-sm);
+  padding: var(--space-2);
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--space-2);
 }
 
 .fail-row {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  font-size: 12px;
+  font-size: var(--font-xs);
 }
 
 .fail-path {
@@ -167,23 +183,29 @@ async function openRecycleBin() {
 }
 
 .fail-err {
-  color: #b91c1c;
+  color: var(--danger);
 }
 
 .skipped {
-  font-size: 12px;
+  font-size: var(--font-xs);
   color: var(--text-secondary);
 }
 
 .skipped summary {
   cursor: pointer;
+  user-select: none;
+  transition: color var(--dur-fast) var(--ease);
+}
+
+.skipped summary:hover {
+  color: var(--text);
 }
 
 .modal-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 10px;
-  margin-top: 6px;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
 }
 
 .modal-actions button {
@@ -191,9 +213,22 @@ async function openRecycleBin() {
   border: 1px solid var(--border);
 }
 
+.modal-actions button:hover {
+  background: var(--bg);
+  border-color: var(--border-strong);
+}
+
 .modal-actions button.primary {
   background: var(--accent);
   border-color: transparent;
   color: #fff;
+}
+
+.modal-actions button.primary:hover {
+  background: var(--accent-hover);
+}
+
+.modal-actions button.primary:active {
+  background: var(--accent-press);
 }
 </style>

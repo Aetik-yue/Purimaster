@@ -81,7 +81,24 @@ async function forceQuit() {
 <template>
   <main class="page">
     <header class="topbar">
-      <h1>Purimaster <span class="sub">净化大师</span></h1>
+      <h1>
+        <!-- 定稿 Logo：design/logos/final.svg 内联（P 字标），currentColor 随标题文字色 -->
+        <svg
+          class="logo"
+          viewBox="0 0 512 512"
+          width="22"
+          height="22"
+          aria-hidden="true"
+        >
+          <g fill="currentColor">
+            <rect x="148" y="80" width="64" height="352" />
+            <path
+              d="M 361.727 213.623 A 104 104 0 1 0 295.57 289.728 L 298.949 288.401 L 302.21 286.804 L 305.259 284.795 L 307.984 282.244 L 310.25 279.036 L 311.907 275.068 L 312.786 270.258 L 312.703 264.54 L 311.462 257.868 L 308.852 250.219 L 302.119 245.909 L 296.64 242.431 L 292.212 239.756 L 288.641 237.835 L 285.75 236.6 L 283.376 235.964 L 281.373 235.822 L 279.614 236.055 L 277.992 236.531 L 276.417 237.105 A 48 48 0 1 1 306.951 201.98 Z"
+            />
+          </g>
+        </svg>
+        Purimaster <span class="sub">净化大师</span>
+      </h1>
       <nav class="tabs">
         <button :class="{ active: tab === 'space' }" @click="tab = 'space'">空间分析</button>
         <button :class="{ active: tab === 'junk' }" @click="tab = 'junk'">垃圾清理</button>
@@ -127,57 +144,76 @@ async function forceQuit() {
   height: 100%;
   display: flex;
   flex-direction: column;
-  padding: 16px 24px 20px;
-  gap: 12px;
+  padding: var(--space-4) var(--space-6) var(--space-5);
+  gap: var(--space-3);
 }
 
 .topbar {
   display: flex;
   align-items: center;
-  gap: 20px;
+  gap: var(--space-6);
   flex-shrink: 0;
 }
 
+/* 字标：P 字标 logo（final.svg 内联，currentColor 随文字色）+ 品牌名 */
 h1 {
-  font-size: 20px;
+  font-size: var(--font-xl);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.logo {
+  display: block;
+  flex-shrink: 0;
 }
 
 .sub {
-  font-size: 12px;
+  font-size: var(--font-xs);
   font-weight: 400;
   color: var(--text-secondary);
-  margin-left: 6px;
+  letter-spacing: 0.08em;
 }
 
+/* 页签：下划线式，靠字重与 2px 强调线区分层级，不做胶囊堆叠 */
 .tabs {
   display: flex;
-  gap: 4px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 3px;
+  gap: var(--space-2);
+  border-bottom: 1px solid var(--border);
 }
 
 .tabs button {
-  padding: 5px 16px;
-  border-radius: 6px;
+  padding: var(--space-2) var(--space-3) var(--space-3);
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  margin-bottom: -1px;
   background: transparent;
   color: var(--text-secondary);
+  transition: color var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease);
+}
+
+.tabs button:hover {
+  color: var(--text);
 }
 
 .tabs button.active {
-  background: var(--accent);
-  color: #fff;
+  color: var(--text);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
 }
 
 .ipc-chip {
   margin-left: auto;
-  font-size: 12px;
+  font-size: var(--font-xs);
   color: var(--text-secondary);
 }
 
 .ipc-chip.ok {
-  color: #1a9e55;
+  color: var(--success);
 }
 
 .ipc-chip.bad {
@@ -187,50 +223,59 @@ h1 {
 
 .ipc-error {
   color: var(--danger);
-  font-size: 12px;
+  font-size: var(--font-xs);
 }
 
 /* 关窗保护弹窗 */
 .overlay {
   position: fixed;
   inset: 0;
-  background: rgba(15, 23, 42, 0.45);
+  background: var(--scrim);
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 50;
+  /* 显隐动效：0.2s 淡入（--dur 区间），无位移，与报告弹窗一致 */
+  animation: overlay-in var(--dur) var(--ease);
+}
+
+@keyframes overlay-in {
+  from {
+    opacity: 0;
+  }
 }
 
 .modal {
   width: 400px;
   max-width: calc(100vw - 48px);
   background: var(--surface);
-  border-radius: 10px;
-  padding: 20px 22px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5) var(--space-6);
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.25);
+  gap: var(--space-3);
+  box-shadow: var(--shadow-3);
 }
 
 .modal h3 {
-  font-size: 16px;
+  font-size: var(--font-lg);
 }
 
 .modal-line {
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: var(--font-sm);
 }
 
 .warn-text {
-  color: #b91c1c;
+  color: var(--danger);
 }
 
 .modal-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 10px;
-  margin-top: 6px;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
 }
 
 .modal-actions button {
@@ -238,9 +283,19 @@ h1 {
   border: 1px solid var(--border);
 }
 
+.modal-actions button:hover {
+  background: var(--bg);
+  border-color: var(--border-strong);
+}
+
 .modal-actions .danger-btn {
   background: var(--danger);
   border-color: transparent;
   color: #fff;
+}
+
+.modal-actions .danger-btn:hover {
+  background: var(--danger-hover);
+  border-color: transparent;
 }
 </style>

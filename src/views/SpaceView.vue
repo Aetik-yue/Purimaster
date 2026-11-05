@@ -296,7 +296,10 @@ function cancelScan() {
 
     <!-- 空态首屏：盘符快捷入口，替代原先一片空白 -->
     <div v-if="!result && !scanning" class="empty-hint">
-      <p>输入或选择要分析的目录，看看空间都去哪了。</p>
+      <div class="empty-text">
+        <p class="empty-title">看看空间都去哪了</p>
+        <p class="empty-sub">输入或选择要分析的目录，或点击下方盘符快速开始</p>
+      </div>
       <div v-if="driveButtons.length > 0" class="drives">
         <button
           v-for="d in driveButtons"
@@ -316,16 +319,18 @@ function cancelScan() {
     </p>
 
     <div v-if="result" class="result">
-      <p class="summary">
-        {{ scannedRoot }} · 共 {{ humanCount(result.filesSeen) }} 个文件，占用
-        {{ humanSize(result.bytesSeen) }}
-        <span v-if="result.skipped > 0">
-          · 跳过 {{ humanCount(result.skipped) }} 项（无权限或读取失败）</span
-        >
-        <span v-if="result.junctions > 0">
-          · 另有 {{ humanCount(result.junctions) }} 个链接/联接点未计入（防重复计数）</span
-        >
-      </p>
+      <!-- 结果英雄数字：占用空间为第一层级，文件数/跳过/链接点降为说明行 -->
+      <div class="hero">
+        <div class="hero-label">{{ scannedRoot }} · 空间占用</div>
+        <div class="hero-number">{{ humanSize(result.bytesSeen) }}</div>
+        <div class="hero-sub">
+          共 {{ humanCount(result.filesSeen) }} 个文件<template v-if="result.skipped > 0">
+            · 跳过 {{ humanCount(result.skipped) }} 项（无权限或读取失败）</template
+          ><template v-if="result.junctions > 0">
+            · 另有 {{ humanCount(result.junctions) }} 个链接/联接点未计入（防重复计数）</template
+          >
+        </div>
+      </div>
       <div class="tree">
         <DirTree
           :node="result.root"
@@ -354,7 +359,7 @@ function cancelScan() {
             <span class="delete-path" :title="f.path">{{ f.path }}</span>
             <span class="delete-size">{{ humanSize(f.size) }}</span>
           </div>
-          <div v-if="selectedList.length > 50" class="detail-line muted">
+          <div v-if="selectedList.length > 50" class="detail-line">
             …共 {{ humanCount(selectedList.length) }} 个文件
           </div>
         </div>
@@ -362,24 +367,26 @@ function cancelScan() {
           共 <strong>{{ humanCount(selected.size) }}</strong> 个文件 ·
           <strong>{{ humanSize(selectedBytes) }}</strong>
         </p>
-        <p class="detail-line muted option-explain">
+        <p class="detail-line option-explain">
           回收站：文件可随时还原，磁盘空间在清空回收站后才真正释放。永久删除：绕过回收站，
           事后无法恢复。系统/个人目录等受保护路径下的文件会被自动拒绝，并在报告中列出。
         </p>
-        <label class="option">
-          <input v-model="deleteMode" type="radio" value="trash" />
-          移入回收站（推荐，可恢复）
-        </label>
-        <label class="option">
-          <input v-model="deleteMode" type="radio" value="permanent" />
-          永久删除（不可恢复）
-        </label>
-        <label class="option">
-          <input v-model="deleteDryRun" type="checkbox" />
-          先预演（只检查，不删除任何文件）
-        </label>
+        <div class="option-group">
+          <label class="option">
+            <input v-model="deleteMode" type="radio" value="trash" />
+            移入回收站（推荐，可恢复）
+          </label>
+          <label class="option">
+            <input v-model="deleteMode" type="radio" value="permanent" />
+            永久删除（不可恢复）
+          </label>
+          <label class="option">
+            <input v-model="deleteDryRun" type="checkbox" />
+            先预演（只检查，不删除任何文件）
+          </label>
+        </div>
         <template v-if="needsDeleteWord">
-          <p class="warn">
+          <p class="warn danger-note">
             ⚠ 永久删除将绕过回收站直接删除文件，事后无法通过任何方式恢复。
             请输入「删除」以确认执行。
           </p>
@@ -417,12 +424,12 @@ function cancelScan() {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--space-3);
 }
 
 .toolbar {
   display: flex;
-  gap: 10px;
+  gap: var(--space-2);
 }
 
 .path-input {
@@ -444,7 +451,28 @@ function cancelScan() {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-3);
+}
+
+/* 结果英雄数字：不加框，数据即版式（版式规则 1/4） */
+.hero-label {
+  font-size: var(--font-xs);
+  color: var(--text-secondary);
+}
+
+.hero-number {
+  font-size: 34px; /* 视图内英雄数字，与 --font-display 同为展示级 */
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  line-height: 1.1;
+  margin: var(--space-1) 0;
+}
+
+.hero-sub {
+  font-size: var(--font-xs);
+  color: var(--text-secondary);
 }
 
 /* 空态首屏 */
@@ -454,73 +482,96 @@ function cancelScan() {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 16px;
+  gap: var(--space-5);
+  color: var(--text-secondary);
+}
+
+.empty-text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  text-align: center;
+}
+
+.empty-title {
+  font-size: var(--font-lg);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.empty-sub {
+  font-size: var(--font-sm);
   color: var(--text-secondary);
 }
 
 .drives {
   display: flex;
-  gap: 10px;
+  gap: var(--space-2);
   flex-wrap: wrap;
   justify-content: center;
 }
 
 .drive-btn {
   min-width: 96px;
-  padding: 12px 20px;
+  padding: var(--space-3) var(--space-5);
   background: var(--surface);
   border: 1px solid var(--border);
   font-weight: 500;
 }
 
+/* hover = accent-soft 淡底；选中（active）= 松绿描边 + 淡底（版式规则 5） */
 .drive-btn:hover {
-  border-color: var(--accent);
-  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: var(--border-strong);
+  color: var(--text);
 }
 
 .drive-btn.active {
   border-color: var(--accent);
   color: var(--accent);
+  background: var(--accent-soft);
 }
 
 /* 手动删除 */
 .ghost {
   background: transparent;
   border: 1px solid var(--border);
-  padding: 4px 14px;
+  padding: var(--space-1) var(--space-3);
 }
 
+/* 底部选择栏：真浮层才允许阴影（--shadow-2 悬浮条） */
 .selection-bar {
   position: fixed;
   left: 50%;
   transform: translateX(-50%);
-  bottom: 18px;
+  bottom: var(--space-4);
   z-index: 40;
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px 18px;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-5);
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 10px;
-  box-shadow: 0 8px 28px rgba(15, 23, 42, 0.18);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-2);
 }
 
 .selection-text {
-  font-size: 13px;
+  font-size: var(--font-sm);
+  font-weight: 500;
   font-variant-numeric: tabular-nums;
 }
 
 .delete-cancel {
-  margin-left: 10px;
-  padding: 2px 12px;
-  font-size: 12px;
+  margin-left: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--font-xs);
 }
 
 .overlay {
   position: fixed;
   inset: 0;
-  background: rgba(15, 23, 42, 0.45);
+  background: var(--scrim);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -531,12 +582,13 @@ function cancelScan() {
   width: 460px;
   max-width: calc(100vw - 48px);
   background: var(--surface);
-  border-radius: 10px;
-  padding: 20px 22px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5) var(--space-6);
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.25);
+  gap: var(--space-3);
+  box-shadow: var(--shadow-3);
 }
 
 .modal.wide {
@@ -544,18 +596,22 @@ function cancelScan() {
 }
 
 .modal h3 {
-  font-size: 16px;
+  font-size: var(--font-lg);
 }
 
 .modal-line {
   color: var(--text-secondary);
 }
 
+.modal-line strong {
+  color: var(--text);
+}
+
 .modal-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 10px;
-  margin-top: 6px;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
 }
 
 .modal-actions button {
@@ -563,17 +619,36 @@ function cancelScan() {
   border: 1px solid var(--border);
 }
 
+.modal-actions button:hover {
+  background: var(--accent-soft);
+  border-color: var(--border-strong);
+}
+
 .modal-actions button.primary {
   background: var(--accent);
   border-color: transparent;
-  color: #fff;
+  color: var(--text-on-fill);
+}
+
+.modal-actions button.primary:hover {
+  background: var(--accent-hover);
+  border-color: transparent;
 }
 
 .option {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   cursor: pointer;
+}
+
+/* 选项组：1px 细线分隔"删什么"与"怎么删"（版式规则 4） */
+.option-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  border-top: 1px solid var(--border);
+  padding-top: var(--space-3);
 }
 
 .option-explain {
@@ -581,41 +656,40 @@ function cancelScan() {
 }
 
 .detail-line {
-  font-size: 12px;
+  font-size: var(--font-xs);
   color: var(--text-secondary);
   word-break: break-all;
 }
 
-.detail-line.muted {
-  font-size: 11px;
-}
-
+/* 警示：本视图仅有永久删除警示，红色块表达危险语义（版式规则 7） */
 .warn {
-  color: #b91c1c;
-  font-size: 12px;
+  color: var(--danger);
+  font-size: var(--font-xs);
 }
 
-.confirm-word {
-  padding: 8px 10px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  font-size: 14px;
+.warn.danger-note {
+  background: var(--danger-soft);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
 }
+
+/* 确认词输入框样式全部交给全局 input（含聚焦软环） */
 
 .delete-list {
   max-height: 220px;
   overflow-y: auto;
   border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 6px 10px;
+  border-radius: var(--radius);
+  background: var(--bg);
+  padding: var(--space-1) var(--space-3);
 }
 
 .delete-row {
   display: flex;
   justify-content: space-between;
-  gap: 12px;
-  padding: 3px 0;
-  font-size: 12px;
+  gap: var(--space-3);
+  padding: var(--space-1) 0;
+  font-size: var(--font-sm);
 }
 
 .delete-path {
@@ -630,11 +704,6 @@ function cancelScan() {
   font-variant-numeric: tabular-nums;
 }
 
-.summary {
-  color: var(--text-secondary);
-  font-variant-numeric: tabular-nums;
-}
-
 .tree {
   flex: 1;
   min-height: 0;
@@ -642,6 +711,6 @@ function cancelScan() {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 8px;
+  padding: var(--space-2);
 }
 </style>

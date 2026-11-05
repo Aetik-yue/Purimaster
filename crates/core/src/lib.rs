@@ -259,6 +259,9 @@ pub fn scan_space(
         });
 
         // 消费线程：为目录链分配 arena id、聚合统计、回调进度
+        // （ids 缓冲跨记录复用：每条记录一次 Vec 分配是与 I/O 无关的纯 CPU
+        // 开销，全盘扫描目录数为数十万级）
+        let mut ids: Vec<u32> = Vec::new();
         for rec in rx {
             if rec.path == root && rec.unreadable {
                 root_unreadable = true;
@@ -267,7 +270,7 @@ pub fn scan_space(
             bytes_seen += rec.direct_size;
 
             // 收集自身与祖先（含扫描根）的节点 id 链：ids[0]=自身，末尾=根
-            let mut ids: Vec<u32> = Vec::new();
+            ids.clear();
             for anc in rec.path.ancestors().take_while(|p| p.starts_with(&root)) {
                 ids.push(get_or_create(anc, &mut path_ids, &mut nodes));
             }
@@ -429,20 +432,18 @@ fn walk_dir<'env>(path: PathBuf, ctx: &'env WalkCtx<'env>, scope: &rayon::ScopeF
     if ctx.cancel.load(Ordering::Relaxed) {
         return;
     }
-    // 慢目录追踪（诊断用）：PURIMASTER_TRACE_SLOW=1 时，单目录遍历超过 2 秒打印路径
+    // 慢目录追踪（诊断用）：PURIMASTER_TRACE_SLOW=1 时，单目录遍历超过 2 秒打印路径。
+    // Instant 只在开关开启时取——默认关（Windows 上一次 QPC 调用 × 数十万目录纯属浪费）
     let trace_slow = trace_slow_enabled();
-    let started = std::time::Instant::now();
-    let mut rec = DirRecord {
-        path: path.clone(),
-        direct_files: 0,
-        direct_size: 0,
-        unreadable: false,
-    };
+    let started = trace_slow.then(std::time::Instant::now);
+    let mut direct_files = 0u64;
+    let mut direct_size = 0u64;
+    let mut unreadable = false;
     match fs::read_dir(&path) {
         Ok(entries) => {
             for entry in entries {
                 if ctx.cancel.load(Ordering::Relaxed) {
-                    return; // 不发送 rec：已取消，结果将被丢弃
+                    return; // 不发送记录：已取消，结果将被丢弃
                 }
                 let Ok(entry) = entry else {
                     ctx.skipped.fetch_add(1, Ordering::Relaxed);
@@ -459,8 +460,8 @@ fn walk_dir<'env>(path: PathBuf, ctx: &'env WalkCtx<'env>, scope: &rayon::ScopeF
                     // std 的 DirEntry::metadata 在 Windows 上零额外系统调用
                     match entry.metadata() {
                         Ok(m) => {
-                            rec.direct_files += 1;
-                            rec.direct_size += m.len();
+                            direct_files += 1;
+                            direct_size += m.len();
                         }
                         Err(_) => {
                             ctx.skipped.fetch_add(1, Ordering::Relaxed);
@@ -474,19 +475,27 @@ fn walk_dir<'env>(path: PathBuf, ctx: &'env WalkCtx<'env>, scope: &rayon::ScopeF
             }
         }
         Err(_) => {
-            // 目录本身读不了（如无权限）：大小未知，标记 unreadable，仍发送 rec
-            rec.unreadable = true;
+            // 目录本身读不了（如无权限）：大小未知，标记 unreadable，仍发送记录
+            unreadable = true;
             ctx.skipped.fetch_add(1, Ordering::Relaxed);
         }
     }
-    if trace_slow && started.elapsed().as_secs_f32() > 2.0 {
+    if let Some(started) = started
+        && started.elapsed().as_secs_f32() > 2.0
+    {
         eprintln!(
             "[slow-dir {:.1}s] {}",
             started.elapsed().as_secs_f32(),
             path.display()
         );
     }
-    let _ = ctx.tx.send(rec);
+    // 记录发送前才构造，path 直接 move（省去每目录一次完整路径的堆分配+拷贝）
+    let _ = ctx.tx.send(DirRecord {
+        path,
+        direct_files,
+        direct_size,
+        unreadable,
+    });
 }
 
 #[cfg(test)]
@@ -558,6 +567,40 @@ mod tests {
             .map(|c| c.name)
             .collect();
         assert_eq!(names, ["large", "small"]);
+    }
+
+    #[test]
+    fn sibling_branches_aggregate_into_shared_ancestors() {
+        // perf-3 回归：消费循环的祖先 id 缓冲改为跨记录复用（clear + 重建）后，
+        // 每条目录记录的祖先链聚合仍须逐链正确——多条兄弟分支共享祖先时，
+        // 上一条记录残留的 id 不得污染本条的父链建立与尺寸累计。
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let a_sub = a.join("sub");
+        let b = dir.path().join("b");
+        fs::create_dir_all(&a_sub).unwrap();
+        fs::create_dir(&b).unwrap();
+        fs::write(a.join("f1.bin"), [0u8; 10]).unwrap();
+        fs::write(a_sub.join("f2.bin"), [0u8; 20]).unwrap();
+        fs::write(b.join("f3.bin"), [0u8; 40]).unwrap();
+
+        let idx = scan(dir.path(), &AtomicBool::new(false)).unwrap();
+        let root = root_of(&idx);
+        assert_eq!(root.files, 3);
+        assert_eq!(root.size, 70);
+        assert_eq!(root.dirs, 3, "a、a/sub、b 三条记录都应落在根上");
+
+        let children = idx.children(idx.root_id());
+        let sa = children.iter().find(|c| c.name == "a").unwrap();
+        assert_eq!(sa.size, 30, "a 应含自身与 sub 的文件");
+        assert_eq!(sa.files, 2);
+        assert_eq!(sa.dirs, 1, "只有 sub 一层子目录");
+        assert!(sa.has_children);
+        let sb = children.iter().find(|c| c.name == "b").unwrap();
+        assert_eq!(sb.size, 40);
+        assert_eq!(sb.files, 1);
+        assert_eq!(sb.dirs, 0);
+        assert!(!sb.has_children);
     }
 
     #[test]

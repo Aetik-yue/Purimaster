@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- 设计说明：三个方块沿对角线逐级消散——实心（占用）→空心（清空中）→残点（已回收），等距节奏如逐帧动画，表达磁盘空间被逐级吸走归零。 -->
+  <g fill="#1F2430">
+    <rect x="32" y="32" width="192" height="192"/>
+    <rect x="288" y="288" width="96" height="96" fill="none" stroke="#1F2430" stroke-width="64"/>
+    <rect x="448" y="448" width="32" height="32"/>
+  </g>
+</svg>

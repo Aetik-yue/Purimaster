@@ -355,9 +355,8 @@ onUnmounted(() => {
         </div>
         <span class="prog-size">{{ sizeLabel(p) }}</span>
       </div>
-      <div v-if="filtered.length === 0 && !loading" class="empty-hint">
-        没有匹配的软件。
-      </div>
+      <div v-if="loading" class="empty-hint status">正在读取已安装软件…</div>
+      <div v-else-if="filtered.length === 0" class="empty-hint">没有匹配的软件。</div>
     </div>
 
     <!-- 卸载确认弹窗 -->
@@ -375,7 +374,7 @@ onUnmounted(() => {
           <strong>逐个启动官方卸载器</strong>：请在每个弹出的窗口中完成卸载，
           过程中可能请求管理员权限。
         </p>
-        <p class="detail-line muted">
+        <p class="detail-line">
           卸载完成后会自动扫描文件与注册表残留，逐项确认后才会删除（注册表删除受保护清单约束，
           仅允许该软件自己的键）。
         </p>
@@ -401,21 +400,17 @@ onUnmounted(() => {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--space-3);
 }
 
 .toolbar {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--space-3);
   flex-shrink: 0;
 }
 
-.ghost {
-  background: transparent;
-  border: 1px solid var(--border);
-  padding: 6px 14px;
-}
+/* ghost 按钮统一由全局 button.ghost 提供（hover = accent-soft 淡底） */
 
 .filter-input {
   flex: 1;
@@ -439,22 +434,23 @@ onUnmounted(() => {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 10px 14px;
+  padding: var(--space-3) var(--space-4);
   flex-shrink: 0;
 }
 
 .panel-title {
-  font-size: 13px;
+  font-size: var(--font-sm);
+  font-weight: 600;
   color: var(--text);
-  margin-bottom: 6px;
+  margin-bottom: var(--space-2);
 }
 
 .progress-row {
   display: flex;
   justify-content: space-between;
-  gap: 12px;
-  padding: 3px 0;
-  font-size: 13px;
+  gap: var(--space-3);
+  padding: var(--space-1) 0;
+  font-size: var(--font-sm);
 }
 
 .progress-name {
@@ -468,7 +464,7 @@ onUnmounted(() => {
 }
 
 .progress-status.ok {
-  color: #1a7f47;
+  color: var(--success);
 }
 
 .progress-status.fail {
@@ -476,16 +472,16 @@ onUnmounted(() => {
 }
 
 .residue-name {
-  font-size: 13px;
-  margin: 6px 0 3px;
+  font-size: var(--font-sm);
+  margin: var(--space-2) 0 var(--space-1);
 }
 
 .residue-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 3px 0;
-  font-size: 12px;
+  gap: var(--space-2);
+  padding: var(--space-1) 0;
+  font-size: var(--font-xs);
   cursor: pointer;
 }
 
@@ -505,8 +501,8 @@ onUnmounted(() => {
 .modal-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 10px;
-  margin-top: 6px;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
 }
 
 .modal-actions button {
@@ -514,16 +510,31 @@ onUnmounted(() => {
   border: 1px solid var(--border);
 }
 
+.modal-actions button:hover {
+  background: var(--accent-soft);
+  border-color: var(--border-strong);
+}
+
 .modal-actions button.danger {
   background: var(--danger);
   border-color: transparent;
-  color: #fff;
+  color: var(--text-on-fill);
+}
+
+.modal-actions button.danger:hover {
+  background: var(--danger-hover);
+  border-color: transparent;
 }
 
 .modal-actions button.primary {
   background: var(--accent);
   border-color: transparent;
-  color: #fff;
+  color: var(--text-on-fill);
+}
+
+.modal-actions button.primary:hover {
+  background: var(--accent-hover);
+  border-color: transparent;
 }
 
 .list {
@@ -533,42 +544,44 @@ onUnmounted(() => {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 8px 14px;
+  padding: var(--space-2) var(--space-4);
 }
 
 .list-head {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 6px 0;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
   border-bottom: 1px solid var(--border);
 }
 
 .select-all {
   display: flex;
   align-items: center;
-  gap: 6px;
-  font-size: 13px;
+  gap: var(--space-2);
+  font-size: var(--font-sm);
   cursor: pointer;
   user-select: none;
 }
 
 .hint-text {
-  font-size: 12px;
+  font-size: var(--font-xs);
   color: var(--text-secondary);
 }
 
 .prog-row {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 6px;
-  border-radius: 8px;
+  gap: var(--space-3);
+  padding: var(--space-2);
+  border-radius: var(--radius);
   border-bottom: 1px solid var(--border);
+  transition: background-color var(--dur-fast) var(--ease);
 }
 
+/* 行 hover 统一 accent-soft 淡底（替换存量旧蓝） */
 .prog-row:hover {
-  background: rgba(47, 111, 237, 0.05);
+  background: var(--accent-soft);
 }
 
 .file-check {
@@ -587,7 +600,7 @@ onUnmounted(() => {
 .prog-line {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .prog-name {
@@ -598,13 +611,13 @@ onUnmounted(() => {
 }
 
 .prog-version {
-  font-size: 12px;
+  font-size: var(--font-xs);
   color: var(--text-secondary);
   flex-shrink: 0;
 }
 
 .prog-sub {
-  font-size: 12px;
+  font-size: var(--font-xs);
   color: var(--text-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -619,16 +632,22 @@ onUnmounted(() => {
   color: var(--text-secondary);
 }
 
+/* 空态 / 加载态占位：留白给足，不加框 */
 .empty-hint {
-  padding: 24px;
+  padding: var(--space-8) var(--space-6);
   text-align: center;
   color: var(--text-secondary);
+}
+
+/* 加载态：进行中语义用松绿（覆盖 .empty-hint 的说明灰） */
+.empty-hint.status {
+  color: var(--accent);
 }
 
 .overlay {
   position: fixed;
   inset: 0;
-  background: rgba(15, 23, 42, 0.45);
+  background: var(--scrim);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -639,31 +658,33 @@ onUnmounted(() => {
   width: 460px;
   max-width: calc(100vw - 48px);
   background: var(--surface);
-  border-radius: 10px;
-  padding: 20px 22px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5) var(--space-6);
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.25);
+  gap: var(--space-3);
+  box-shadow: var(--shadow-3);
 }
 
 .modal h3 {
-  font-size: 16px;
+  font-size: var(--font-lg);
 }
 
 .confirm-list {
   max-height: 200px;
   overflow-y: auto;
   border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 6px 10px;
+  border-radius: var(--radius);
+  background: var(--bg);
+  padding: var(--space-1) var(--space-3);
 }
 
 .confirm-row {
   display: flex;
   justify-content: space-between;
-  padding: 3px 0;
-  font-size: 13px;
+  padding: var(--space-1) 0;
+  font-size: var(--font-sm);
 }
 
 .confirm-size {
@@ -673,16 +694,16 @@ onUnmounted(() => {
 
 .modal-line {
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: var(--font-sm);
+}
+
+.modal-line strong {
+  color: var(--text);
 }
 
 .detail-line {
-  font-size: 12px;
+  font-size: var(--font-xs);
   color: var(--text-secondary);
   line-height: 1.6;
-}
-
-.detail-line.muted {
-  font-size: 11px;
 }
 </style>

@@ -435,9 +435,17 @@ impl RuleSet {
                         }
                         files += 1;
                         bytes += size;
-                        top.push(std::cmp::Reverse((size, path.display().to_string())));
-                        if top.len() > PREVIEW_LIMIT {
-                            top.pop();
+                        // 预览堆是多重集：容量已满且 size 严格小于堆顶（当前最小）
+                        // 时，新元素入堆后必然立即被弹出——直接跳过路径格式化分配
+                        // 与 push/pop，堆内容不变。同尺寸必须走原路径（(size, path)
+                        // 名字决胜可能保留新元素）；计数器在堆操作前已累加，不受影响。
+                        let below_min = top.len() == PREVIEW_LIMIT
+                            && top.peek().is_some_and(|item| size < item.0.0);
+                        if !below_min {
+                            top.push(std::cmp::Reverse((size, path.display().to_string())));
+                            if top.len() > PREVIEW_LIMIT {
+                                top.pop();
+                            }
                         }
                         progress(JunkScanProgress {
                             rule_index: rule_index as u32,
@@ -609,19 +617,14 @@ pub fn expand_env(input: &str) -> String {
     out
 }
 
-/// 路径去重键：大小写不敏感 + 分隔符归一（Windows 语义）。
+/// 路径去重键：与 [`purimaster_platform::normalize`] 同语义——`\\?\` verbatim
+/// 前缀剥离 + 全 Unicode 大小写折叠（NTFS 大小写不敏感覆盖全 Unicode）+
+/// 分隔符归一 + 尾分隔符去除。
 ///
 /// 不做 `canonicalize`（每文件一次代价过高）；联接点/8.3 别名造成的重复计数
 /// 是已记录的限制，由删除阶段的目标级真实路径校验兜底。
 fn dedup_key(path: &Path) -> String {
-    let mut s = path
-        .to_string_lossy()
-        .replace('/', "\\")
-        .to_ascii_lowercase();
-    while s.len() > 3 && s.ends_with('\\') {
-        s.pop();
-    }
-    s
+    purimaster_platform::normalize(path)
 }
 
 /// collect_files 的旁路统计（跳过/近期/问题明细），收拢为一避免参数爆炸。
@@ -682,28 +685,39 @@ fn collect_files(
             if !ft.is_file() {
                 continue; // 符号链接/其它类型不参与
             }
-            let rel = match path.strip_prefix(root) {
-                Ok(rel) => rel
-                    .components()
-                    .map(|c| c.as_os_str().to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join("/"),
-                Err(_) => {
-                    stats.skipped += 1;
+            // rel 仅被下方 include/exclude 的 glob 匹配消费：两过滤器均为 None 时
+            // （compile_globs 空表返回 None；定向清理不带类型过滤即是此形态），
+            // 整套构造（strip_prefix + components 收集 + join，每文件至少 2 次堆
+            // 分配）是纯死工作，直接跳过。路径都源自本遍历的 entry.path()，
+            // strip_prefix 在实践中不可能失败——其 Err 分支的 skipped 统计因此
+            // 只存在于有过滤器的路径上，两个 None 分支的输出与原实现逐字节一致。
+            if include.is_some() || exclude.is_some() {
+                let rel = match path.strip_prefix(root) {
+                    Ok(rel) => rel
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                    Err(_) => {
+                        stats.skipped += 1;
+                        continue;
+                    }
+                };
+                if exclude.is_some_and(|ex| ex.is_match(&rel)) {
                     continue;
                 }
-            };
-            if exclude.is_some_and(|ex| ex.is_match(&rel)) {
-                continue;
-            }
-            if include.is_some_and(|inc| !inc.is_match(&rel)) {
-                continue;
+                if include.is_some_and(|inc| !inc.is_match(&rel)) {
+                    continue;
+                }
             }
             let Ok(meta) = entry.metadata() else {
                 stats.skipped += 1;
                 continue;
             };
             if let Some(min_age) = min_age {
+                // 仅做 SystemTime 时间点算术（elapsed() 不经过本地时区）：
+                // DST 切换不可能影响该判断；后续实现不得引入本地时间/日历天数
+                // 换算（边界语义由测试 min_age_boundary_exact_age_is_deletable 钉住）。
                 let is_fresh = match meta.modified() {
                     // 修改时间晚于截止点 → 近期文件；elapsed 出错（未来时间戳）同判
                     Ok(m) => m.elapsed().map(|age| age < min_age).unwrap_or(true),
@@ -769,7 +783,14 @@ impl RuleSet {
     /// 按规则 id 清理垃圾文件。
     ///
     /// - 删除前**重新枚举**规则目标并**重新校验**（ADR-0003，不信任扫描结果）
-    /// - 归属计算与 `scan` 一致：按规则顺序全局去重，保证实际删除量不超过确认弹窗的统计
+    /// - 归属计算与 `scan` 一致：按规则顺序全局去重，保证不会**重复**删除
+    ///   已计入确认统计的文件；但 `min_age` 在本阶段按**删除时点**重新逐文件
+    ///   求值——扫描时"太新"被排除、扫描与清理之间越过阈值的文件会被删除，
+    ///   且它从未出现在用户确认的统计里（`deleted_files` 可大于确认数）。
+    ///   这是"超范围交付"而非误删（删除时点仍满足规则条件，逐文件八步校验
+    ///   独立兜底），如实记录语义而非假装统计封闭；特征测试
+    ///   `clean_may_delete_files_that_age_in_between_scan_and_clean` 钉住现状，
+    ///   若产品决定收紧为快照截止时间，以该测试为回归锚点
     /// - 单个文件失败不中断，计入 `failed`
     /// - 取消会提前结束，已完成的部分保留在报告中（`cancelled = true`）
     /// - `progress`：每条选中规则开始与每个文件处理完后回调（调用方负责节流）
@@ -1048,6 +1069,35 @@ paths = [{paths}]
     }
 
     #[test]
+    fn no_filter_counts_deeply_nested_files() {
+        // perf-1：无 include/exclude 时 rel 相对路径不再构造（守卫分支）。
+        // 深层嵌套 + 每层都有文件：守卫不得改变计数、字节数与预览排序。
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("junk");
+        fs::create_dir(&junk).unwrap();
+        fs::write(junk.join("f0.bin"), [0u8; 1]).unwrap();
+        let mut cur = junk.clone();
+        for depth in 1..=6usize {
+            cur = cur.join(format!("d{depth}"));
+            fs::create_dir(&cur).unwrap();
+            fs::write(cur.join(format!("f{depth}.bin")), vec![0u8; depth * 10]).unwrap();
+        }
+
+        let toml = rule_toml(&tomldir(&junk), None, None);
+        let set =
+            RuleSet::from_toml_strs_with_protection(&[&toml], &Protection::default()).unwrap();
+        let result = scan_with(&set);
+
+        assert_eq!(result.total_files, 7);
+        assert_eq!(result.total_bytes, 1 + 10 + 20 + 30 + 40 + 50 + 60);
+        let group = &result.groups[0];
+        assert_eq!(group.files, 7);
+        assert_eq!(group.top_files[0].size, 60, "最深的文件应是最大预览");
+        assert!(group.top_files[0].path.ends_with("f6.bin"));
+        assert!(group.problems.is_empty());
+    }
+
+    #[test]
     fn include_and_exclude_globs() {
         let dir = tempfile::tempdir().unwrap();
         let junk = dir.path().join("junk");
@@ -1258,6 +1308,73 @@ paths = [{path}, {path}]
     }
 
     #[test]
+    fn unicode_case_variants_of_same_dir_dedup_to_one() {
+        // safety-4：NTFS 大小写不敏感覆盖全 Unicode（"ä" 与 "Ä" 是同一目录）。
+        // 两种拼法都能通过 is_dir 与保护检查，去重键若只做 ASCII 小写就会
+        // 重复建目标、重复计数——确认统计虚高（删除安全由 delete.rs 逐文件
+        // 八步校验独立兜底，折叠过度是"少计"的安全方向）。
+        let dir = tempfile::tempdir().unwrap();
+        let junk_lower = dir.path().join("junkä");
+        fs::create_dir(&junk_lower).unwrap();
+        fs::write(junk_lower.join("a.bin"), [0u8; 10]).unwrap();
+        let junk_upper = dir.path().join("junkÄ");
+        assert!(junk_upper.is_dir(), "前提：NTFS 应把 Ä 拼法解析到同一目录");
+
+        let lower = tomldir(&junk_lower);
+        let upper = tomldir(&junk_upper);
+        let toml = format!(
+            r#"
+[categories]
+temp = "临时文件"
+
+[[rule]]
+id = "r1"
+category = "temp"
+title = "R1"
+paths = [{lower}, {upper}]
+"#
+        );
+        let set =
+            RuleSet::from_toml_strs_with_protection(&[&toml], &Protection::default()).unwrap();
+        assert_eq!(
+            set.rules()[0].targets.len(),
+            1,
+            "Unicode 大小写变体在编译期就该去重为同一目标"
+        );
+        let result = scan_with(&set);
+        assert_eq!(result.total_files, 1, "同一目录两种拼法不得重复计数");
+        assert_eq!(result.groups[0].files, 1);
+        assert_eq!(result.total_bytes, 10);
+    }
+
+    #[test]
+    fn dedup_key_matches_platform_normalize_semantics() {
+        // safety-4：去重键与 platform::normalize（保护检查的比较键）同语义——
+        // \\?\ verbatim 前缀剥离 + 全 Unicode 大小写折叠 + 分隔符/尾分隔符归一
+        assert_eq!(
+            dedup_key(Path::new(r"\\?\C:\Temp\")),
+            dedup_key(Path::new(r"C:\Temp")),
+            "verbatim 前缀应被剥离"
+        );
+        assert_eq!(
+            dedup_key(Path::new(r"C:\Jürgen\Temp")),
+            dedup_key(Path::new(r"C:\JÜRGEN\Temp")),
+            "非 ASCII 大小写应折叠（NTFS 全 Unicode 不敏感）"
+        );
+        // 原有语义逐项保持
+        assert_eq!(
+            dedup_key(Path::new(r"c:/x/y/")),
+            dedup_key(Path::new(r"C:\x\y"))
+        );
+        assert_eq!(dedup_key(Path::new(r"C:\")), "c:\\");
+        assert_eq!(
+            dedup_key(Path::new(r"C:\a")),
+            dedup_key(Path::new(r"c:\a")),
+            "ASCII 大小写折叠不得回退"
+        );
+    }
+
+    #[test]
     fn cancelled_scan_returns_error() {
         let toml = r#"
 [categories]
@@ -1386,6 +1503,42 @@ paths = ["C:\\r2"]
         // 预览为最大的 50 个，首条应为 60 字节
         assert_eq!(group.top_files[0].size, 60);
         assert_eq!(group.top_files.last().unwrap().size, 11);
+    }
+
+    #[test]
+    fn preview_equal_sizes_keep_tie_break_behavior() {
+        // perf-4：堆满后同尺寸文件必须走原 push/pop 路径（(size, path) 名字决胜
+        // 可能保留新元素），只有严格小于堆顶才允许跳过。60 个同尺寸文件 →
+        // 最终留下的应是 (size, path) 序下最大的 50 个，即路径字典序 f10..f59，
+        // 输出按 (size 降序, path 升序) 排列——与跳过优化前的结果逐字节一致。
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("junk");
+        fs::create_dir(&junk).unwrap();
+        for i in 0..60usize {
+            fs::write(junk.join(format!("f{i:02}.bin")), [0u8; 8]).unwrap();
+        }
+        let toml = rule_toml(&tomldir(&junk), None, None);
+        let set =
+            RuleSet::from_toml_strs_with_protection(&[&toml], &Protection::default()).unwrap();
+        let result = scan_with(&set);
+
+        assert_eq!(result.total_files, 60);
+        let group = &result.groups[0];
+        assert_eq!(group.top_files.len(), PREVIEW_LIMIT);
+        for f in &group.top_files {
+            assert_eq!(f.size, 8);
+        }
+        // 排序输出：同尺寸按路径升序，首条 f10.bin、末条 f59.bin
+        assert!(group.top_files[0].path.ends_with("f10.bin"));
+        assert!(group.top_files.last().unwrap().path.ends_with("f59.bin"));
+        let names: Vec<&str> = group
+            .top_files
+            .iter()
+            .filter_map(|f| f.path.rsplit('\\').next())
+            .collect();
+        for (expect_i, name) in names.iter().enumerate() {
+            assert_eq!(*name, format!("f{:02}.bin", expect_i + 10));
+        }
     }
 
     #[test]
@@ -1762,20 +1915,31 @@ paths = ["C:\\__purimaster_no_such_b__"]
     /// 非 Windows 平台 no-op——min_age 逻辑本身有独立于平台的单测覆盖）
     #[cfg(windows)]
     fn set_mtime(path: &Path, age_secs: u64) {
+        set_mtime_at(
+            path,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs),
+        );
+    }
+
+    /// 把文件修改时间设为任意 [`std::time::SystemTime`] 时刻（支持未来时间戳与
+    /// 精确阈值边界）。仅做 SystemTime 时间点算术，**禁本地时区换算**——与
+    /// min_age 判定同口径（DST 切换不影响，见 collect_files 的 min_age 分支注释）。
+    #[cfg(windows)]
+    fn set_mtime_at(path: &Path, at: std::time::SystemTime) {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Foundation::{FILETIME, HANDLE};
         use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, SetFileTime};
 
-        // FILETIME = 100ns 自 1601-01-01；UNIX epoch 差 11,644,473,600 秒
-        let target = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            - age_secs;
-        let ft100ns = (target + 11_644_473_600) * 10_000_000;
+        // FILETIME = 100ns 自 1601-01-01；UNIX epoch 差 11,644,473,600 秒。
+        // 按 100ns 粒度换算；as_nanos 截断只会让 mtime 更早 → elapsed 更大，
+        // 边界测试因此天然偏向"已越过阈值"一侧（确定性成立）。
+        let ft100ns: i64 = match at.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => (d.as_nanos() / 100) as i64 + 11_644_473_600 * 10_000_000,
+            Err(e) => -((e.duration().as_nanos() / 100) as i64) + 11_644_473_600 * 10_000_000,
+        };
         let ft = FILETIME {
-            dwLowDateTime: (ft100ns & 0xFFFF_FFFF) as u32,
-            dwHighDateTime: (ft100ns >> 32) as u32,
+            dwLowDateTime: (ft100ns as u64 & 0xFFFF_FFFF) as u32,
+            dwHighDateTime: ((ft100ns as u64) >> 32) as u32,
         };
         // 改 mtime 需要 FILE_WRITE_ATTRIBUTES 访问权：custom_access_mask + 该位，
         // 只读打开会静默失败（SetFileTime 返回假成功之外的静默丢弃）
@@ -1801,6 +1965,9 @@ paths = ["C:\\__purimaster_no_such_b__"]
     #[cfg(not(windows))]
     fn set_mtime(_path: &Path, _age_secs: u64) {}
 
+    #[cfg(not(windows))]
+    fn set_mtime_at(_path: &Path, _at: std::time::SystemTime) {}
+
     #[test]
     fn parse_min_age_units() {
         assert_eq!(parse_min_age("24h"), Ok(Duration::from_secs(86400)));
@@ -1812,6 +1979,162 @@ paths = ["C:\\__purimaster_no_such_b__"]
         assert!(parse_min_age("0d").is_err());
         assert!(parse_min_age("24x").is_err());
         assert!(parse_min_age("-1d").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn min_age_future_mtime_is_fresh_and_never_deleted() {
+        // 未来时间戳：m.elapsed() 出错 → unwrap_or(true) 判为 fresh（宁可不删）。
+        // 这是 min_age 判定的保守分支之一（elapsed 出错 / modified 出错 / 恰等
+        // 阈值），此前零覆盖（原夹具 set_mtime 用 u64 计算，结构上造不出未来
+        // 时间戳）。
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("junk");
+        fs::create_dir(&junk).unwrap();
+        let future = junk.join("future.bin");
+        fs::write(&future, [0u8; 10]).unwrap();
+        set_mtime_at(
+            &future,
+            std::time::SystemTime::now() + std::time::Duration::from_secs(2 * 3600),
+        );
+
+        let toml = format!(
+            r#"
+[categories]
+temp = "临时文件"
+
+[[rule]]
+id = "test-rule"
+category = "temp"
+title = "测试规则"
+min_age = "24h"
+paths = [{paths}]
+"#,
+            paths = tomldir(&junk)
+        );
+        let set =
+            RuleSet::from_toml_strs_with_protection(&[&toml], &Protection::default()).unwrap();
+
+        let result = scan_with(&set);
+        let group = &result.groups[0];
+        assert_eq!(group.files, 0, "未来时间戳不得计入可清理统计");
+        assert_eq!(
+            group.fresh_files, 1,
+            "未来时间戳（elapsed 出错）应计入 fresh"
+        );
+
+        let report = set.clean(
+            &["test-rule".to_string()],
+            &AtomicBool::new(false),
+            clean_opts(purimaster_platform::DeleteMode::Permanent, false),
+            &mut |_| {},
+        );
+        assert_eq!(report.deleted_files, 0);
+        assert!(future.exists(), "未来时间戳的文件不得被删除");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn min_age_boundary_exact_age_is_deletable() {
+        // 阈值恰等：age == min_age 时 `age < min_age` 为 false → 允许删除
+        //（与 RuleDef::min_age 注释"修改时间晚于该阈值的文件跳过不计"一致：
+        // 只有严格晚于阈值的才跳过）。mtime 回拨到 now-24h 后 elapsed 只会
+        // 更大，断言确定性成立；同时钉住"DST 不可能影响 min_age"的前提——
+        // 判定只做 SystemTime 时间点算术，若有人改成本地时间/日历天数实现，
+        // 本测试与 collect_files 的 min_age 注释会拦截。
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("junk");
+        fs::create_dir(&junk).unwrap();
+        let boundary = junk.join("boundary.bin");
+        fs::write(&boundary, [0u8; 7]).unwrap();
+        set_mtime_at(
+            &boundary,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 3600),
+        );
+
+        let toml = format!(
+            r#"
+[categories]
+temp = "临时文件"
+
+[[rule]]
+id = "test-rule"
+category = "temp"
+title = "测试规则"
+min_age = "24h"
+paths = [{paths}]
+"#,
+            paths = tomldir(&junk)
+        );
+        let set =
+            RuleSet::from_toml_strs_with_protection(&[&toml], &Protection::default()).unwrap();
+
+        let result = scan_with(&set);
+        let group = &result.groups[0];
+        assert_eq!(group.files, 1, "恰等于阈值不算 fresh，应计入可清理统计");
+        assert_eq!(group.fresh_files, 0);
+
+        let report = set.clean(
+            &["test-rule".to_string()],
+            &AtomicBool::new(false),
+            clean_opts(purimaster_platform::DeleteMode::Permanent, false),
+            &mut |_| {},
+        );
+        assert_eq!(report.deleted_files, 1);
+        assert!(!boundary.exists(), "恰等于阈值的文件允许被删除");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clean_may_delete_files_that_age_in_between_scan_and_clean() {
+        // 特征测试（不改逻辑，固化现状，2026-11-06 审查）：min_age 在 clean 阶段
+        // 按删除时点重新求值——扫描时因"太新"被排除的文件，若在扫描与清理之间
+        // 越过阈值（min_age 粒度为 h/d/w，窗口可能长达数小时），clean 会将其删除。
+        // 该文件从未出现在用户确认的 files/bytes 里：deleted_files 可大于扫描
+        // files。这是"超范围交付"而非误删（文件在删除时点仍满足规则自身条件，
+        // 八步校验全过、保护路径不受影响）；clean 的文档注释已如实描述该语义。
+        // 若产品决定收紧（如 clean 快照扫描时刻的截止时间戳），本测试即回归锚点。
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("junk");
+        fs::create_dir(&junk).unwrap();
+        let aged = junk.join("ages-later.bin");
+        fs::write(&aged, [0u8; 10]).unwrap(); // 刚创建：对 1h 阈值是"太新"
+
+        let toml = format!(
+            r#"
+[categories]
+temp = "临时文件"
+
+[[rule]]
+id = "test-rule"
+category = "temp"
+title = "测试规则"
+min_age = "1h"
+paths = [{paths}]
+"#,
+            paths = tomldir(&junk)
+        );
+        let set =
+            RuleSet::from_toml_strs_with_protection(&[&toml], &Protection::default()).unwrap();
+
+        let result = scan_with(&set);
+        assert_eq!(result.groups[0].files, 0, "扫描时文件太新，不进确认统计");
+        assert_eq!(result.groups[0].fresh_files, 1);
+
+        // 扫描之后、清理之前：文件越过 1h 阈值（回拨到 2h 前）
+        set_mtime(&aged, 2 * 3600);
+
+        let report = set.clean(
+            &["test-rule".to_string()],
+            &AtomicBool::new(false),
+            clean_opts(purimaster_platform::DeleteMode::Permanent, false),
+            &mut |_| {},
+        );
+        assert_eq!(
+            report.deleted_files, 1,
+            "clean 按删除时点重新求值 min_age：可能删除从未出现在确认统计中的文件"
+        );
+        assert!(!aged.exists());
     }
 
     #[test]

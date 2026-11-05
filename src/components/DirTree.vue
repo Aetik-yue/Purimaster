@@ -258,23 +258,25 @@ onMounted(() => {
 .row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  height: 32px;
-  padding-right: 12px;
-  border-radius: 6px;
+  gap: var(--space-2);
+  height: 32px; /* 行高落 4px 网格 */
+  padding-right: var(--space-3);
+  border-radius: var(--radius-sm);
   cursor: pointer;
   user-select: none;
+  transition: background-color var(--dur-fast) var(--ease);
 }
 
+/* 行 hover 统一为松绿淡底（替换存量旧蓝 rgba(47,111,237,…)） */
 .row:hover {
-  background: rgba(47, 111, 237, 0.06);
+  background: var(--accent-soft);
 }
 
 .caret {
   width: 14px;
   text-align: center;
   color: var(--text-secondary);
-  transition: transform 0.12s;
+  transition: transform var(--dur-fast) var(--ease);
   flex-shrink: 0;
 }
 
@@ -286,7 +288,11 @@ onMounted(() => {
   visibility: hidden;
 }
 
+/* flex:1 撑满剩余宽度：文件行的字节数列与目录行一样靠右缘对齐；
+   min-width:0 让长名截断（ellipsis）真正生效 */
 .name {
+  flex: 1;
+  min-width: 0;
   font-weight: 500;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -310,21 +316,23 @@ onMounted(() => {
   accent-color: var(--accent);
 }
 
+/* 无权限/含未知：警示语义徽章——soft 底由 --warning 混合 surface 得出，
+   字重 500 补足 12px 小字的辨识度 */
 .badge {
   display: inline-block;
-  margin-left: 6px;
-  padding: 1px 6px;
-  font-size: 11px;
-  font-weight: 400;
-  color: #b45309;
-  background: #fef3c7;
-  border-radius: 4px;
+  margin-left: var(--space-1);
+  padding: 1px var(--space-2);
+  font-size: var(--font-xs);
+  font-weight: 500;
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 8%, var(--surface));
+  border-radius: var(--radius-sm);
 }
 
 .meta {
   margin-left: auto;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--font-xs);
   flex-shrink: 0;
 }
 
@@ -340,7 +348,7 @@ onMounted(() => {
   display: flex;
   align-items: center;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--font-xs);
 }
 
 .file-note.error {
@@ -353,17 +361,26 @@ onMounted(() => {
 }
 
 .show-more {
-  margin-left: 8px;
-  padding: 1px 8px;
-  font-size: 12px;
+  margin-left: var(--space-2);
+  padding: 1px var(--space-2);
+  font-size: var(--font-xs);
   background: transparent;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   color: var(--accent);
   cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease);
 }
 
+/* hover 反馈统一：淡底 + 描边加深（禁用态由全局 button:disabled 兜底） */
 .show-more:hover {
-  border-color: var(--accent);
+  background: var(--accent-soft);
+  border-color: var(--border-strong);
+}
+
+.show-more:disabled:hover {
+  background: transparent;
+  border-color: var(--border);
 }
 </style>
