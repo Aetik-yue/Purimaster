@@ -18,6 +18,9 @@ src-tauri/gen/
 .idea/
 *.swp
 
+# ===== 工具机器目录（ZCode 工作流草稿/运行记录） =====
+.zcode/
+
 # ===== OS =====
 Thumbs.db
 Desktop.ini
